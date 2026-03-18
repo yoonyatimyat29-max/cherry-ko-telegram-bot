@@ -1,1 +1,7 @@
 project_id = "kkpbygxpvldifnrmpfft"
+
+[functions.telegram-bot1-poll]
+verify_jwt = false
+
+[functions.telegram-bot2-poll]
+verify_jwt = false
