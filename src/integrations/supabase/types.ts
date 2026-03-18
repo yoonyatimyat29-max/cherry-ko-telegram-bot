@@ -14,7 +14,165 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      bot1_conversations: {
+        Row: {
+          chat_id: number
+          id: string
+          state: string
+          updated_at: string
+        }
+        Insert: {
+          chat_id: number
+          id?: string
+          state?: string
+          updated_at?: string
+        }
+        Update: {
+          chat_id?: number
+          id?: string
+          state?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      bot1_state: {
+        Row: {
+          id: number
+          update_offset: number
+          updated_at: string
+        }
+        Insert: {
+          id: number
+          update_offset?: number
+          updated_at?: string
+        }
+        Update: {
+          id?: number
+          update_offset?: number
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      bot2_states: {
+        Row: {
+          bot_id: string
+          id: string
+          update_offset: number
+          updated_at: string
+        }
+        Insert: {
+          bot_id: string
+          id?: string
+          update_offset?: number
+          updated_at?: string
+        }
+        Update: {
+          bot_id?: string
+          id?: string
+          update_offset?: number
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "bot2_states_bot_id_fkey"
+            columns: ["bot_id"]
+            isOneToOne: true
+            referencedRelation: "bots"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      bots: {
+        Row: {
+          api_key: string
+          bot_name: string | null
+          bot_username: string | null
+          created_at: string
+          id: string
+          is_active: boolean
+          owner_chat_id: number
+        }
+        Insert: {
+          api_key: string
+          bot_name?: string | null
+          bot_username?: string | null
+          created_at?: string
+          id?: string
+          is_active?: boolean
+          owner_chat_id: number
+        }
+        Update: {
+          api_key?: string
+          bot_name?: string | null
+          bot_username?: string | null
+          created_at?: string
+          id?: string
+          is_active?: boolean
+          owner_chat_id?: number
+        }
+        Relationships: []
+      }
+      trigger_pointers: {
+        Row: {
+          bot_id: string
+          id: string
+          pointer: number
+          trigger_text: string
+        }
+        Insert: {
+          bot_id: string
+          id?: string
+          pointer?: number
+          trigger_text: string
+        }
+        Update: {
+          bot_id?: string
+          id?: string
+          pointer?: number
+          trigger_text?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "trigger_pointers_bot_id_fkey"
+            columns: ["bot_id"]
+            isOneToOne: false
+            referencedRelation: "bots"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      trigger_responses: {
+        Row: {
+          bot_id: string
+          created_at: string
+          id: string
+          response_text: string
+          trigger_text: string
+        }
+        Insert: {
+          bot_id: string
+          created_at?: string
+          id?: string
+          response_text: string
+          trigger_text: string
+        }
+        Update: {
+          bot_id?: string
+          created_at?: string
+          id?: string
+          response_text?: string
+          trigger_text?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "trigger_responses_bot_id_fkey"
+            columns: ["bot_id"]
+            isOneToOne: false
+            referencedRelation: "bots"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
     }
     Views: {
       [_ in never]: never
