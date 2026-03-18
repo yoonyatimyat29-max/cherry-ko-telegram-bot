@@ -57,6 +57,11 @@ export default {
           border: "hsl(var(--sidebar-border))",
           ring: "hsl(var(--sidebar-ring))",
         },
+        telegram: {
+          blue: "hsl(var(--telegram-blue))",
+          green: "hsl(var(--telegram-green))",
+        },
+        surface: "hsl(var(--surface))",
       },
       borderRadius: {
         lg: "var(--radius)",
