@@ -3,6 +3,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 const GATEWAY_URL = 'https://connector-gateway.lovable.dev/telegram';
 const MAX_RUNTIME_MS = 55_000;
 const MIN_REMAINING_MS = 5_000;
+const BOT_TOKEN_REGEX = /^\d+:[A-Za-z0-9_-]{30,}$/;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -28,7 +29,6 @@ Deno.serve(async (req) => {
 
   let totalProcessed = 0;
 
-  // Read initial offset
   const { data: state, error: stateErr } = await supabase
     .from('bot1_state')
     .select('update_offset')
@@ -49,23 +49,14 @@ Deno.serve(async (req) => {
     const timeout = Math.min(50, Math.floor(remainingMs / 1000) - 5);
     if (timeout < 1) break;
 
-    const response = await fetch(`${GATEWAY_URL}/getUpdates`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${LOVABLE_API_KEY}`,
-        'X-Connection-Api-Key': TELEGRAM_API_KEY,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        offset: currentOffset,
-        timeout,
-        allowed_updates: ['message', 'callback_query'],
-      }),
-    });
+    const data = await callGateway('getUpdates', {
+      offset: currentOffset,
+      timeout,
+      allowed_updates: ['message', 'callback_query'],
+    }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
 
-    const data = await response.json();
-    if (!response.ok) {
-      console.error('Telegram API error:', data);
+    if (!data.ok) {
+      console.error('Telegram gateway getUpdates error:', data);
       return new Response(JSON.stringify({ error: data }), { status: 502, headers: corsHeaders });
     }
 
@@ -74,11 +65,9 @@ Deno.serve(async (req) => {
 
     for (const update of updates) {
       try {
-        // Handle callback query (button press)
         if (update.callback_query) {
           const cb = update.callback_query;
           if (cb.data === 'create_bot') {
-            // Set conversation state to waiting for API key
             await supabase
               .from('bot1_conversations')
               .upsert({
@@ -87,155 +76,198 @@ Deno.serve(async (req) => {
                 updated_at: new Date().toISOString(),
               }, { onConflict: 'chat_id' });
 
-            // Answer callback query
-            await fetch(`${GATEWAY_URL}/answerCallbackQuery`, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${LOVABLE_API_KEY}`,
-                'X-Connection-Api-Key': TELEGRAM_API_KEY,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({ callback_query_id: cb.id }),
-            });
+            await callGateway('answerCallbackQuery', {
+              callback_query_id: cb.id,
+            }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
 
-            // Ask for API key
-            await fetch(`${GATEWAY_URL}/sendMessage`, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${LOVABLE_API_KEY}`,
-                'X-Connection-Api-Key': TELEGRAM_API_KEY,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                chat_id: cb.message.chat.id,
-                text: '🔑 ကျေးဇူးပြု၍ @BotFather ထံမှ ရရှိသော Bot API Key ကို ပေးပို့ပါ။\n\n@BotFather ကို /newbot လို့ပို့ပြီး Bot တစ်ခုဖန်တီးပါ။ ပြီးရင် API Key ကို ဒီမှာ ပေးပို့ပါ။',
-              }),
-            });
+            await callGateway('sendMessage', {
+              chat_id: cb.message.chat.id,
+              text: '🔑 ကျေးဇူးပြု၍ @BotFather ထံမှ ရရှိသော Bot API Key ကို ပေးပို့ပါ။\n\n@BotFather ကို /newbot လို့ပို့ပြီး Bot တစ်ခုဖန်တီးပါ။ ပြီးရင် API Key ကို ဒီမှာ ပေးပို့ပါ။',
+            }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
           }
+
           totalProcessed++;
           continue;
         }
 
-        // Handle messages
-        if (update.message) {
-          const msg = update.message;
-          const chatId = msg.chat.id;
-          const text = msg.text || '';
+        if (!update.message) continue;
 
-          // Handle /start command
-          if (text === '/start') {
-            await fetch(`${GATEWAY_URL}/sendMessage`, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${LOVABLE_API_KEY}`,
-                'X-Connection-Api-Key': TELEGRAM_API_KEY,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                chat_id: chatId,
-                text: '🤖 မင်္ဂလာပါ! ဒီ Bot က စကားပြော Bot အသစ်များ ဖန်တီးပေးပါတယ်။\n\nBot ဖန်တီးရန် အောက်က Button ကို နှိပ်ပါ။',
-                reply_markup: {
-                  inline_keyboard: [[
-                    { text: '🆕 Bot ဖန်တီးရန်', callback_data: 'create_bot' }
-                  ]]
-                }
-              }),
-            });
+        const msg = update.message;
+        const chatId = msg.chat.id;
+        const text = (msg.text || '').trim();
+
+        if (text === '/start') {
+          await callGateway('sendMessage', {
+            chat_id: chatId,
+            text: '🤖 မင်္ဂလာပါ! ဒီ Bot က စကားပြော Bot အသစ်များ ဖန်တီးပေးပါတယ်။\n\nBot ဖန်တီးရန် အောက်က Button ကို နှိပ်ပါ။',
+            reply_markup: {
+              inline_keyboard: [[
+                { text: '🆕 Bot ဖန်တီးရန်', callback_data: 'create_bot' },
+              ]],
+            },
+          }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+
+          totalProcessed++;
+          continue;
+        }
+
+        const { data: convo } = await supabase
+          .from('bot1_conversations')
+          .select('state')
+          .eq('chat_id', chatId)
+          .single();
+
+        if (convo?.state !== 'waiting_api_key') {
+          totalProcessed++;
+          continue;
+        }
+
+        if (!BOT_TOKEN_REGEX.test(text)) {
+          await callGateway('sendMessage', {
+            chat_id: chatId,
+            text: '❌ API Key format မမှန်ပါ။ @BotFather မှ token ကို တိတိကျကျ copy/paste လုပ်ပြီး ထပ်ပို့ပါ။',
+          }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+          totalProcessed++;
+          continue;
+        }
+
+        const processing = await callGateway('sendMessage', {
+          chat_id: chatId,
+          text: '⏳ Bot API Key ကို စစ်ဆေးပြီး Bot ဖန်တီးနေပါသည်...',
+        }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+
+        const processingMsgId = processing.result?.message_id as number | undefined;
+        const apiKey = text;
+
+        const validateData = await callTelegramDirect(apiKey, 'getMe', {});
+        if (!validateData.ok) {
+          await editOrSendMessage(chatId, processingMsgId, '❌ API Key မမှန်ပါ။ @BotFather ထံမှ မှန်ကန်သော API Key ကို ပေးပို့ပါ။', LOVABLE_API_KEY, TELEGRAM_API_KEY);
+          totalProcessed++;
+          continue;
+        }
+
+        const webhookData = await callTelegramDirect(apiKey, 'deleteWebhook', { drop_pending_updates: false });
+        if (!webhookData.ok) {
+          await editOrSendMessage(
+            chatId,
+            processingMsgId,
+            '❌ ဒီ Bot မှာ webhook conflict ရှိနေပါတယ်။ BotFather မှ /deleteWebhook ပြီးမှ ထပ်ပို့ပါ။',
+            LOVABLE_API_KEY,
+            TELEGRAM_API_KEY,
+          );
+          totalProcessed++;
+          continue;
+        }
+
+        const botInfo = validateData.result;
+
+        const { data: sameKeyBots, error: existingErr } = await supabase
+          .from('bots')
+          .select('id')
+          .eq('api_key', apiKey)
+          .order('created_at', { ascending: true });
+
+        if (existingErr) {
+          console.error('Error finding existing bot:', existingErr);
+          await editOrSendMessage(chatId, processingMsgId, '❌ Bot ဖန်တီးရာတွင် error ဖြစ်နေပါတယ်။ ထပ်စမ်းပါ။', LOVABLE_API_KEY, TELEGRAM_API_KEY);
+          totalProcessed++;
+          continue;
+        }
+
+        let targetBotId: string;
+        let isNewBot = false;
+
+        if (sameKeyBots && sameKeyBots.length > 0) {
+          targetBotId = sameKeyBots[0].id;
+
+          const { error: updateErr } = await supabase
+            .from('bots')
+            .update({
+              bot_username: botInfo.username,
+              bot_name: botInfo.first_name,
+              owner_chat_id: chatId,
+              is_active: true,
+            })
+            .eq('id', targetBotId);
+
+          if (updateErr) {
+            console.error('Error updating existing bot:', updateErr);
+            await editOrSendMessage(chatId, processingMsgId, '❌ Bot update မအောင်မြင်ပါ။ ထပ်စမ်းပါ။', LOVABLE_API_KEY, TELEGRAM_API_KEY);
             totalProcessed++;
             continue;
           }
 
-          // Check if user is in "waiting for API key" state
-          const { data: convo } = await supabase
-            .from('bot1_conversations')
-            .select('state')
-            .eq('chat_id', chatId)
+          if (sameKeyBots.length > 1) {
+            const duplicateIds = sameKeyBots.slice(1).map((b) => b.id);
+            await supabase
+              .from('bots')
+              .update({ is_active: false })
+              .in('id', duplicateIds);
+          }
+        } else {
+          const { data: newBot, error: insertErr } = await supabase
+            .from('bots')
+            .insert({
+              api_key: apiKey,
+              bot_username: botInfo.username,
+              bot_name: botInfo.first_name,
+              owner_chat_id: chatId,
+              is_active: true,
+            })
+            .select('id')
             .single();
 
-          if (convo?.state === 'waiting_api_key' && text.includes(':')) {
-            // Validate the API key by calling getMe
-            const processingMsg = await fetch(`${GATEWAY_URL}/sendMessage`, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${LOVABLE_API_KEY}`,
-                'X-Connection-Api-Key': TELEGRAM_API_KEY,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                chat_id: chatId,
-                text: '⏳ Bot API Key ကို စစ်ဆေးနေပါသည်...',
-              }),
-            });
-            const processingData = await processingMsg.json();
-            const processingMsgId = processingData.result?.message_id;
-
-            // Validate by calling Telegram API directly with the user's bot token
-            const validateResp = await fetch(`https://api.telegram.org/bot${text}/getMe`);
-            const validateData = await validateResp.json();
-
-            if (validateData.ok) {
-              const botInfo = validateData.result;
-
-              // Save bot to database
-              const { data: newBot, error: botErr } = await supabase
-                .from('bots')
-                .insert({
-                  api_key: text,
-                  bot_username: botInfo.username,
-                  bot_name: botInfo.first_name,
-                  owner_chat_id: chatId,
-                })
-                .select()
-                .single();
-
-              if (botErr) {
-                console.error('Error saving bot:', botErr);
-                await editMessage(chatId, processingMsgId, '❌ Bot သိမ်းဆည်းရာတွင် အမှားရှိပါသည်။ ထပ်စမ်းပါ။');
-              } else {
-                // Create bot2 polling state
-                await supabase
-                  .from('bot2_states')
-                  .insert({ bot_id: newBot.id, update_offset: 0 });
-
-                // Set the bot's start message
-                await fetch(`https://api.telegram.org/bot${text}/setMyCommands`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    commands: [{ command: 'start', description: 'Bot ကို စတင်ပါ' }],
-                  }),
-                });
-
-                // Edit processing message to success
-                await editMessage(chatId, processingMsgId,
-                  `✅ Bot @${botInfo.username} အောင်မြင်စွာ ဖန်တီးပြီးပါပြီ!\n\n🧠 ဒီ Bot က Group ထဲမှာ စကားပြောသင်ယူပါလိမ့်မယ်။\n\nGroup ထဲထည့်ရန် အောက်က Button ကို နှိပ်ပါ။`,
-                  {
-                    inline_keyboard: [[
-                      { text: '➕ Group ထဲ ထည့်ရန်', url: `https://t.me/${botInfo.username}?startgroup=true` }
-                    ], [
-                      { text: '🆕 နောက်ထပ် Bot ဖန်တီးရန်', callback_data: 'create_bot' }
-                    ]]
-                  }
-                );
-
-                // Reset conversation state
-                await supabase
-                  .from('bot1_conversations')
-                  .update({ state: 'idle', updated_at: new Date().toISOString() })
-                  .eq('chat_id', chatId);
-              }
-            } else {
-              await editMessage(chatId, processingMsgId, '❌ API Key မမှန်ပါ။ @BotFather ထံမှ မှန်ကန်သော API Key ကို ပေးပို့ပါ။');
-            }
+          if (insertErr || !newBot) {
+            console.error('Error saving bot:', insertErr);
+            await editOrSendMessage(chatId, processingMsgId, '❌ Bot သိမ်းဆည်းရာတွင် အမှားရှိပါသည်။ ထပ်စမ်းပါ။', LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            totalProcessed++;
+            continue;
           }
-          totalProcessed++;
+
+          targetBotId = newBot.id;
+          isNewBot = true;
         }
+
+        await supabase
+          .from('bot2_states')
+          .upsert({
+            bot_id: targetBotId,
+            update_offset: 0,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: 'bot_id' });
+
+        await callTelegramDirect(apiKey, 'setMyCommands', {
+          commands: [{ command: 'start', description: 'Bot ကို စတင်ပါ' }],
+        });
+
+        await editOrSendMessage(
+          chatId,
+          processingMsgId,
+          isNewBot
+            ? `✅ Bot @${botInfo.username} အောင်မြင်စွာ ဖန်တီးပြီးပါပြီ!\n\nGroup ထဲထည့်ရန် အောက်က Button ကို နှိပ်ပါ။`
+            : `✅ Bot @${botInfo.username} ကို ပြန်လည် activate လုပ်ပြီးပါပြီ!\n\nGroup ထဲထည့်ရန် အောက်က Button ကို နှိပ်ပါ။`,
+          LOVABLE_API_KEY,
+          TELEGRAM_API_KEY,
+          {
+            inline_keyboard: [[
+              { text: '➕ Group ထဲ ထည့်ရန်', url: `https://t.me/${botInfo.username}?startgroup=true` },
+            ], [
+              { text: '🆕 နောက်ထပ် Bot ဖန်တီးရန်', callback_data: 'create_bot' },
+            ]],
+          },
+        );
+
+        await supabase
+          .from('bot1_conversations')
+          .update({ state: 'idle', updated_at: new Date().toISOString() })
+          .eq('chat_id', chatId);
+
+        totalProcessed++;
       } catch (err) {
         console.error('Error processing update:', err);
       }
     }
 
-    // Advance offset
     const newOffset = Math.max(...updates.map((u: any) => u.update_id)) + 1;
     await supabase
       .from('bot1_state')
@@ -244,21 +276,67 @@ Deno.serve(async (req) => {
     currentOffset = newOffset;
   }
 
-  return new Response(JSON.stringify({ ok: true, processed: totalProcessed }), { headers: corsHeaders });
+  return new Response(JSON.stringify({ ok: true, processed: totalProcessed }), {
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+});
 
-  // Helper function to edit messages
-  async function editMessage(chatId: number, messageId: number, text: string, replyMarkup?: any) {
-    const body: any = { chat_id: chatId, message_id: messageId, text };
+async function callGateway(
+  method: string,
+  payload: Record<string, unknown>,
+  LOVABLE_API_KEY: string,
+  TELEGRAM_API_KEY: string,
+) {
+  const response = await fetch(`${GATEWAY_URL}/${method}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${LOVABLE_API_KEY}`,
+      'X-Connection-Api-Key': TELEGRAM_API_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  return response.json();
+}
+
+async function callTelegramDirect(
+  botToken: string,
+  method: string,
+  payload: Record<string, unknown>,
+) {
+  const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  return response.json();
+}
+
+async function editOrSendMessage(
+  chatId: number,
+  messageId: number | undefined,
+  text: string,
+  LOVABLE_API_KEY: string,
+  TELEGRAM_API_KEY: string,
+  replyMarkup?: unknown,
+) {
+  if (messageId) {
+    const body: Record<string, unknown> = {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+    };
+
     if (replyMarkup) body.reply_markup = replyMarkup;
 
-    await fetch(`${GATEWAY_URL}/editMessageText`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${LOVABLE_API_KEY}`,
-        'X-Connection-Api-Key': TELEGRAM_API_KEY!,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
+    await callGateway('editMessageText', body, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+    return;
   }
-});
+
+  const body: Record<string, unknown> = { chat_id: chatId, text };
+  if (replyMarkup) body.reply_markup = replyMarkup;
+
+  await callGateway('sendMessage', body, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+}
