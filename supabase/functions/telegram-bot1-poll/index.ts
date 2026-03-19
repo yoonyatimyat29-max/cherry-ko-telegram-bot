@@ -220,10 +220,12 @@ Deno.serve(async (req) => {
         if (text === '/start') {
           await callGateway('sendMessage', {
             chat_id: chatId,
-            text: '🤖 မင်္ဂလာပါ! ဒီ Bot က စကားပြော Bot အသစ်များ ဖန်တီးပေးပါတယ်။\n\nBot ဖန်တီးရန် အောက်က Button ကို နှိပ်ပါ။',
+            text: '🤖 မင်္ဂလာပါ! ဒီ Bot က စကားပြော Bot အသစ်များ ဖန်တီးပေးပါတယ်။',
             reply_markup: {
               inline_keyboard: [[
                 { text: '🆕 Bot ဖန်တီးရန်', callback_data: 'create_bot' },
+              ], [
+                { text: '📋 Bot များ ကြည့်ရန်', callback_data: 'list_bots' },
               ]],
             },
           }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
