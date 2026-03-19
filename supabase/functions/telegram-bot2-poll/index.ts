@@ -63,16 +63,20 @@ Deno.serve(async (req) => {
         });
 
         if (!data.ok) {
-          if (data.error_code === 409) {
+          const isConflict = String(data.error_code) === '409';
+          const isWebhookConflict = isConflict && String(data.description || '').toLowerCase().includes('webhook');
+
+          if (isWebhookConflict) {
             const webhookResult = await callTelegram(bot.api_key, 'deleteWebhook', { drop_pending_updates: false });
             if (webhookResult.ok) {
               console.log(`Disabled webhook for @${bot.bot_username} and switched to polling`);
             } else {
               console.error(`Failed to disable webhook for @${bot.bot_username}:`, webhookResult);
             }
-          } else {
+          } else if (!isConflict) {
             console.error(`Bot ${bot.bot_username} API error:`, data);
           }
+
           continue;
         }
 

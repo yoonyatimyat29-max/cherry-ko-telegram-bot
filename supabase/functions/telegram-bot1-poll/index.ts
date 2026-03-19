@@ -56,6 +56,11 @@ Deno.serve(async (req) => {
     }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
 
     if (!data.ok) {
+      if (String(data.error_code) === '409') {
+        console.log('Bot 1 polling run overlapped with another getUpdates call, skipping this cycle');
+        break;
+      }
+
       console.error('Telegram gateway getUpdates error:', data);
       return new Response(JSON.stringify({ error: data }), { status: 502, headers: corsHeaders });
     }
