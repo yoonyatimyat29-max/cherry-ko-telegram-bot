@@ -57,11 +57,10 @@ Deno.serve(async (req) => {
 
     if (!data.ok) {
       if (String(data.error_code) === '409') {
-        console.log('Bot 1 polling run overlapped with another getUpdates call, skipping this cycle');
+        console.log('Bot 1 polling overlapped, skipping');
         break;
       }
-
-      console.error('Telegram gateway getUpdates error:', data);
+      console.error('Telegram gateway error:', data);
       return new Response(JSON.stringify({ error: data }), { status: 502, headers: corsHeaders });
     }
 
@@ -75,18 +74,12 @@ Deno.serve(async (req) => {
           const cbChatId = cb.message.chat.id;
           const cbData = cb.data || '';
 
-          await callGateway('answerCallbackQuery', {
-            callback_query_id: cb.id,
-          }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+          await callGateway('answerCallbackQuery', { callback_query_id: cb.id }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
 
           if (cbData === 'create_bot') {
             await supabase
               .from('bot1_conversations')
-              .upsert({
-                chat_id: cbChatId,
-                state: 'waiting_api_key',
-                updated_at: new Date().toISOString(),
-              }, { onConflict: 'chat_id' });
+              .upsert({ chat_id: cbChatId, state: 'waiting_api_key', updated_at: new Date().toISOString() }, { onConflict: 'chat_id' });
 
             await callGateway('sendMessage', {
               chat_id: cbChatId,
@@ -96,7 +89,7 @@ Deno.serve(async (req) => {
           } else if (cbData === 'list_bots') {
             const { data: myBots } = await supabase
               .from('bots')
-              .select('id, bot_username, bot_name, is_active, created_at')
+              .select('id, bot_username, bot_name, is_active, created_at, start_link')
               .eq('owner_chat_id', cbChatId)
               .order('created_at', { ascending: true });
 
@@ -104,11 +97,7 @@ Deno.serve(async (req) => {
               await callGateway('sendMessage', {
                 chat_id: cbChatId,
                 text: '📭 သင့်မှာ ဖန်တီးထားတဲ့ Bot မရှိသေးပါ။',
-                reply_markup: {
-                  inline_keyboard: [[
-                    { text: '🆕 Bot ဖန်တီးရန်', callback_data: 'create_bot' },
-                  ]],
-                },
+                reply_markup: { inline_keyboard: [[{ text: '🆕 Bot ဖန်တီးရန်', callback_data: 'create_bot' }]] },
               }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
             } else {
               let listText = `📋 သင့် Bot များ (${myBots.length} ခု):\n\n`;
@@ -117,15 +106,14 @@ Deno.serve(async (req) => {
               for (let i = 0; i < myBots.length; i++) {
                 const b = myBots[i];
                 const status = b.is_active ? '🟢' : '🔴';
-                listText += `${i + 1}. ${status} @${b.bot_username || b.bot_name || 'Unknown'}\n`;
+                const linkStatus = b.start_link ? ' 🔗' : '';
+                listText += `${i + 1}. ${status} @${b.bot_username || b.bot_name || 'Unknown'}${linkStatus}\n`;
                 keyboard.push([
-                  { text: `🗑 @${b.bot_username || b.bot_name} ဖျက်ရန်`, callback_data: `delete_bot:${b.id}` },
+                  { text: `⚙️ @${b.bot_username || b.bot_name}`, callback_data: `manage_bot:${b.id}` },
                 ]);
               }
 
-              keyboard.push([
-                { text: '🔙 နောက်သို့', callback_data: 'back_to_menu' },
-              ]);
+              keyboard.push([{ text: '🔙 နောက်သို့', callback_data: 'back_to_menu' }]);
 
               await callGateway('sendMessage', {
                 chat_id: cbChatId,
@@ -134,61 +122,148 @@ Deno.serve(async (req) => {
               }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
             }
 
+          } else if (cbData.startsWith('manage_bot:')) {
+            const botId = cbData.replace('manage_bot:', '');
+            const { data: bot } = await supabase
+              .from('bots')
+              .select('id, bot_username, bot_name, owner_chat_id, is_active, start_link')
+              .eq('id', botId)
+              .single();
+
+            if (!bot || String(bot.owner_chat_id) !== String(cbChatId)) {
+              await callGateway('sendMessage', { chat_id: cbChatId, text: '❌ ဒီ Bot ကို စီမံခွင့်မရှိပါ။' }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            } else {
+              const name = bot.bot_username || bot.bot_name || 'Unknown';
+              const status = bot.is_active ? '🟢 Active' : '🔴 Inactive';
+              const linkInfo = bot.start_link ? `\n🔗 Link: ${bot.start_link}` : '\n🔗 Link: မထည့်ရသေးပါ';
+
+              const keyboard: any[][] = [];
+
+              if (bot.start_link) {
+                keyboard.push([{ text: '🔗 Link ပြောင်းရန်', callback_data: `set_link:${bot.id}` }]);
+                keyboard.push([{ text: '❌ Link ဖျက်ရန်', callback_data: `remove_link:${bot.id}` }]);
+              } else {
+                keyboard.push([{ text: '🔗 Channel/Group Link ထည့်ရန်', callback_data: `set_link:${bot.id}` }]);
+              }
+
+              if (bot.is_active) {
+                keyboard.push([{ text: '🗑 Bot ဖျက်ရန်', callback_data: `delete_bot:${bot.id}` }]);
+              } else {
+                keyboard.push([{ text: '✅ ပြန် Activate လုပ်ရန်', callback_data: `reactivate_bot:${bot.id}` }]);
+              }
+
+              keyboard.push([{ text: '🔙 Bot List', callback_data: 'list_bots' }]);
+
+              await callGateway('sendMessage', {
+                chat_id: cbChatId,
+                text: `⚙️ @${name}\nStatus: ${status}${linkInfo}`,
+                reply_markup: { inline_keyboard: keyboard },
+              }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            }
+
+          } else if (cbData.startsWith('set_link:')) {
+            const botId = cbData.replace('set_link:', '');
+            const { data: bot } = await supabase
+              .from('bots')
+              .select('id, owner_chat_id, bot_username')
+              .eq('id', botId)
+              .single();
+
+            if (!bot || String(bot.owner_chat_id) !== String(cbChatId)) {
+              await callGateway('sendMessage', { chat_id: cbChatId, text: '❌ ခွင့်မရှိပါ။' }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            } else {
+              await supabase
+                .from('bot1_conversations')
+                .upsert({ chat_id: cbChatId, state: `waiting_link:${botId}`, updated_at: new Date().toISOString() }, { onConflict: 'chat_id' });
+
+              await callGateway('sendMessage', {
+                chat_id: cbChatId,
+                text: `🔗 @${bot.bot_username} အတွက် Channel သို့မဟုတ် Group Link ကို ပို့ပေးပါ။\n\nဥပမာ: https://t.me/your_channel`,
+              }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            }
+
+          } else if (cbData.startsWith('remove_link:')) {
+            const botId = cbData.replace('remove_link:', '');
+            const { data: bot } = await supabase
+              .from('bots')
+              .select('id, owner_chat_id, bot_username')
+              .eq('id', botId)
+              .single();
+
+            if (!bot || String(bot.owner_chat_id) !== String(cbChatId)) {
+              await callGateway('sendMessage', { chat_id: cbChatId, text: '❌ ခွင့်မရှိပါ။' }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            } else {
+              await supabase.from('bots').update({ start_link: null }).eq('id', botId);
+              await callGateway('sendMessage', {
+                chat_id: cbChatId,
+                text: `✅ @${bot.bot_username} ရဲ့ Link ကို ဖျက်ပြီးပါပြီ။`,
+                reply_markup: { inline_keyboard: [[{ text: '🔙 Bot စီမံရန်', callback_data: `manage_bot:${botId}` }]] },
+              }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            }
+
+          } else if (cbData.startsWith('reactivate_bot:')) {
+            const botId = cbData.replace('reactivate_bot:', '');
+            const { data: bot } = await supabase
+              .from('bots')
+              .select('id, owner_chat_id, bot_username, api_key')
+              .eq('id', botId)
+              .single();
+
+            if (!bot || String(bot.owner_chat_id) !== String(cbChatId)) {
+              await callGateway('sendMessage', { chat_id: cbChatId, text: '❌ ခွင့်မရှိပါ။' }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            } else {
+              await callTelegramDirect(bot.api_key, 'deleteWebhook', { drop_pending_updates: false });
+              await supabase.from('bots').update({ is_active: true }).eq('id', botId);
+              await supabase.from('bot2_states').upsert({ bot_id: botId, update_offset: 0, updated_at: new Date().toISOString() }, { onConflict: 'bot_id' });
+
+              await callGateway('sendMessage', {
+                chat_id: cbChatId,
+                text: `✅ @${bot.bot_username} ကို ပြန် activate လုပ်ပြီးပါပြီ!`,
+                reply_markup: { inline_keyboard: [[{ text: '🔙 Bot စီမံရန်', callback_data: `manage_bot:${botId}` }]] },
+              }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            }
+
           } else if (cbData.startsWith('delete_bot:')) {
             const botId = cbData.replace('delete_bot:', '');
-
-            const { data: botToDelete } = await supabase
+            const { data: bot } = await supabase
               .from('bots')
               .select('id, bot_username, bot_name, owner_chat_id')
               .eq('id', botId)
               .single();
 
-            if (!botToDelete || botToDelete.owner_chat_id !== cbChatId) {
-              await callGateway('sendMessage', {
-                chat_id: cbChatId,
-                text: '❌ ဒီ Bot ကို ဖျက်ခွင့်မရှိပါ။',
-              }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            if (!bot || String(bot.owner_chat_id) !== String(cbChatId)) {
+              await callGateway('sendMessage', { chat_id: cbChatId, text: '❌ ဒီ Bot ကို ဖျက်ခွင့်မရှိပါ။' }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
             } else {
               await callGateway('sendMessage', {
                 chat_id: cbChatId,
-                text: `⚠️ @${botToDelete.bot_username || botToDelete.bot_name} ကို ဖျက်မှာ သေချာပါသလား?\n\nသင်ယူထားတဲ့ data များ ဆုံးရှုံးမှာမဟုတ်ပါ။ Bot ကိုသာ ပိတ်ပေးပါမယ်။`,
+                text: `⚠️ @${bot.bot_username || bot.bot_name} ကို ဖျက်မှာ သေချာပါသလား?`,
                 reply_markup: {
-                  inline_keyboard: [[
-                    { text: '✅ ဖျက်မယ်', callback_data: `confirm_delete:${botId}` },
-                    { text: '❌ မဖျက်ဘူး', callback_data: 'list_bots' },
-                  ]],
+                  inline_keyboard: [
+                    [{ text: '✅ ဖျက်မယ်', callback_data: `confirm_delete:${botId}` }, { text: '❌ မဖျက်ဘူး', callback_data: `manage_bot:${botId}` }],
+                  ],
                 },
               }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
             }
 
           } else if (cbData.startsWith('confirm_delete:')) {
             const botId = cbData.replace('confirm_delete:', '');
-
-            const { data: botToDel } = await supabase
+            const { data: bot } = await supabase
               .from('bots')
               .select('id, bot_username, bot_name, owner_chat_id')
               .eq('id', botId)
               .single();
 
-            if (!botToDel || botToDel.owner_chat_id !== cbChatId) {
-              await callGateway('sendMessage', {
-                chat_id: cbChatId,
-                text: '❌ ဒီ Bot ကို ဖျက်ခွင့်မရှိပါ။',
-              }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            if (!bot || String(bot.owner_chat_id) !== String(cbChatId)) {
+              await callGateway('sendMessage', { chat_id: cbChatId, text: '❌ ဒီ Bot ကို ဖျက်ခွင့်မရှိပါ။' }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
             } else {
-              await supabase
-                .from('bots')
-                .update({ is_active: false })
-                .eq('id', botId);
-
+              await supabase.from('bots').update({ is_active: false }).eq('id', botId);
               await callGateway('sendMessage', {
                 chat_id: cbChatId,
-                text: `🗑 @${botToDel.bot_username || botToDel.bot_name} ကို ဖျက်ပြီးပါပြီ။`,
+                text: `🗑 @${bot.bot_username || bot.bot_name} ကို ဖျက်ပြီးပါပြီ။`,
                 reply_markup: {
-                  inline_keyboard: [[
-                    { text: '📋 Bot များ ကြည့်ရန်', callback_data: 'list_bots' },
-                    { text: '🆕 Bot ဖန်တီးရန်', callback_data: 'create_bot' },
-                  ]],
+                  inline_keyboard: [
+                    [{ text: '📋 Bot များ ကြည့်ရန်', callback_data: 'list_bots' }, { text: '🆕 Bot ဖန်တီးရန်', callback_data: 'create_bot' }],
+                  ],
                 },
               }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
             }
@@ -198,11 +273,10 @@ Deno.serve(async (req) => {
               chat_id: cbChatId,
               text: '🤖 ဘာလုပ်ချင်ပါသလဲ?',
               reply_markup: {
-                inline_keyboard: [[
-                  { text: '🆕 Bot ဖန်တီးရန်', callback_data: 'create_bot' },
-                ], [
-                  { text: '📋 Bot များ ကြည့်ရန်', callback_data: 'list_bots' },
-                ]],
+                inline_keyboard: [
+                  [{ text: '🆕 Bot ဖန်တီးရန်', callback_data: 'create_bot' }],
+                  [{ text: '📋 Bot များ ကြည့်ရန်', callback_data: 'list_bots' }],
+                ],
               },
             }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
           }
@@ -222,14 +296,12 @@ Deno.serve(async (req) => {
             chat_id: chatId,
             text: '🤖 မင်္ဂလာပါ! ဒီ Bot က စကားပြော Bot အသစ်များ ဖန်တီးပေးပါတယ်။',
             reply_markup: {
-              inline_keyboard: [[
-                { text: '🆕 Bot ဖန်တီးရန်', callback_data: 'create_bot' },
-              ], [
-                { text: '📋 Bot များ ကြည့်ရန်', callback_data: 'list_bots' },
-              ]],
+              inline_keyboard: [
+                [{ text: '🆕 Bot ဖန်တီးရန်', callback_data: 'create_bot' }],
+                [{ text: '📋 Bot များ ကြည့်ရန်', callback_data: 'list_bots' }],
+              ],
             },
           }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
-
           totalProcessed++;
           continue;
         }
@@ -240,7 +312,48 @@ Deno.serve(async (req) => {
           .eq('chat_id', chatId)
           .single();
 
-        if (convo?.state !== 'waiting_api_key') {
+        if (!convo) { totalProcessed++; continue; }
+
+        // Handle link setting
+        if (convo.state.startsWith('waiting_link:')) {
+          const botId = convo.state.replace('waiting_link:', '');
+          const link = text;
+
+          if (!link.startsWith('https://') && !link.startsWith('http://') && !link.startsWith('t.me/')) {
+            await callGateway('sendMessage', {
+              chat_id: chatId,
+              text: '❌ Link format မမှန်ပါ။ https:// သို့မဟုတ် t.me/ နဲ့ စသော link ပေးပို့ပါ။',
+            }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            totalProcessed++;
+            continue;
+          }
+
+          const finalLink = link.startsWith('t.me/') ? `https://${link}` : link;
+
+          const { data: bot } = await supabase
+            .from('bots')
+            .select('id, bot_username, owner_chat_id')
+            .eq('id', botId)
+            .single();
+
+          if (!bot || String(bot.owner_chat_id) !== String(chatId)) {
+            await callGateway('sendMessage', { chat_id: chatId, text: '❌ ခွင့်မရှိပါ။' }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+          } else {
+            await supabase.from('bots').update({ start_link: finalLink }).eq('id', botId);
+            await supabase.from('bot1_conversations').update({ state: 'idle', updated_at: new Date().toISOString() }).eq('chat_id', chatId);
+
+            await callGateway('sendMessage', {
+              chat_id: chatId,
+              text: `✅ @${bot.bot_username} ရဲ့ /start Link ကို သတ်မှတ်ပြီးပါပြီ!\n\n🔗 ${finalLink}`,
+              reply_markup: { inline_keyboard: [[{ text: '🔙 Bot စီမံရန်', callback_data: `manage_bot:${botId}` }]] },
+            }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+          }
+
+          totalProcessed++;
+          continue;
+        }
+
+        if (convo.state !== 'waiting_api_key') {
           totalProcessed++;
           continue;
         }
@@ -248,7 +361,7 @@ Deno.serve(async (req) => {
         if (!BOT_TOKEN_REGEX.test(text)) {
           await callGateway('sendMessage', {
             chat_id: chatId,
-            text: '❌ API Key format မမှန်ပါ။ @BotFather မှ token ကို တိတိကျကျ copy/paste လုပ်ပြီး ထပ်ပို့ပါ။',
+            text: '❌ API Key format မမှန်ပါ။ @BotFather မှ token ကို copy/paste လုပ်ပြီး ထပ်ပို့ပါ။',
           }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
           totalProcessed++;
           continue;
@@ -269,18 +382,7 @@ Deno.serve(async (req) => {
           continue;
         }
 
-        const webhookData = await callTelegramDirect(apiKey, 'deleteWebhook', { drop_pending_updates: false });
-        if (!webhookData.ok) {
-          await editOrSendMessage(
-            chatId,
-            processingMsgId,
-            '❌ ဒီ Bot မှာ webhook conflict ရှိနေပါတယ်။ BotFather မှ /deleteWebhook ပြီးမှ ထပ်ပို့ပါ။',
-            LOVABLE_API_KEY,
-            TELEGRAM_API_KEY,
-          );
-          totalProcessed++;
-          continue;
-        }
+        await callTelegramDirect(apiKey, 'deleteWebhook', { drop_pending_updates: false });
 
         const botInfo = validateData.result;
 
@@ -292,7 +394,7 @@ Deno.serve(async (req) => {
 
         if (existingErr) {
           console.error('Error finding existing bot:', existingErr);
-          await editOrSendMessage(chatId, processingMsgId, '❌ Bot ဖန်တီးရာတွင် error ဖြစ်နေပါတယ်။ ထပ်စမ်းပါ။', LOVABLE_API_KEY, TELEGRAM_API_KEY);
+          await editOrSendMessage(chatId, processingMsgId, '❌ Bot ဖန်တီးရာတွင် error ဖြစ်နေပါတယ်။', LOVABLE_API_KEY, TELEGRAM_API_KEY);
           totalProcessed++;
           continue;
         }
@@ -302,30 +404,16 @@ Deno.serve(async (req) => {
 
         if (sameKeyBots && sameKeyBots.length > 0) {
           targetBotId = sameKeyBots[0].id;
-
-          const { error: updateErr } = await supabase
-            .from('bots')
-            .update({
-              bot_username: botInfo.username,
-              bot_name: botInfo.first_name,
-              owner_chat_id: chatId,
-              is_active: true,
-            })
-            .eq('id', targetBotId);
-
-          if (updateErr) {
-            console.error('Error updating existing bot:', updateErr);
-            await editOrSendMessage(chatId, processingMsgId, '❌ Bot update မအောင်မြင်ပါ။ ထပ်စမ်းပါ။', LOVABLE_API_KEY, TELEGRAM_API_KEY);
-            totalProcessed++;
-            continue;
-          }
+          await supabase.from('bots').update({
+            bot_username: botInfo.username,
+            bot_name: botInfo.first_name,
+            owner_chat_id: chatId,
+            is_active: true,
+          }).eq('id', targetBotId);
 
           if (sameKeyBots.length > 1) {
             const duplicateIds = sameKeyBots.slice(1).map((b) => b.id);
-            await supabase
-              .from('bots')
-              .update({ is_active: false })
-              .in('id', duplicateIds);
+            await supabase.from('bots').update({ is_active: false }).in('id', duplicateIds);
           }
         } else {
           const { data: newBot, error: insertErr } = await supabase
@@ -342,7 +430,7 @@ Deno.serve(async (req) => {
 
           if (insertErr || !newBot) {
             console.error('Error saving bot:', insertErr);
-            await editOrSendMessage(chatId, processingMsgId, '❌ Bot သိမ်းဆည်းရာတွင် အမှားရှိပါသည်။ ထပ်စမ်းပါ။', LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            await editOrSendMessage(chatId, processingMsgId, '❌ Bot သိမ်းဆည်းရာတွင် အမှားရှိပါသည်။', LOVABLE_API_KEY, TELEGRAM_API_KEY);
             totalProcessed++;
             continue;
           }
@@ -351,13 +439,11 @@ Deno.serve(async (req) => {
           isNewBot = true;
         }
 
-        await supabase
-          .from('bot2_states')
-          .upsert({
-            bot_id: targetBotId,
-            update_offset: 0,
-            updated_at: new Date().toISOString(),
-          }, { onConflict: 'bot_id' });
+        await supabase.from('bot2_states').upsert({
+          bot_id: targetBotId,
+          update_offset: 0,
+          updated_at: new Date().toISOString(),
+        }, { onConflict: 'bot_id' });
 
         await callTelegramDirect(apiKey, 'setMyCommands', {
           commands: [{ command: 'start', description: 'Bot ကို စတင်ပါ' }],
@@ -367,24 +453,20 @@ Deno.serve(async (req) => {
           chatId,
           processingMsgId,
           isNewBot
-            ? `✅ Bot @${botInfo.username} အောင်မြင်စွာ ဖန်တီးပြီးပါပြီ!\n\nGroup ထဲထည့်ရန် အောက်က Button ကို နှိပ်ပါ။`
-            : `✅ Bot @${botInfo.username} ကို ပြန်လည် activate လုပ်ပြီးပါပြီ!\n\nGroup ထဲထည့်ရန် အောက်က Button ကို နှိပ်ပါ။`,
+            ? `✅ Bot @${botInfo.username} အောင်မြင်စွာ ဖန်တီးပြီးပါပြီ!`
+            : `✅ Bot @${botInfo.username} ကို ပြန်လည် activate လုပ်ပြီးပါပြီ!`,
           LOVABLE_API_KEY,
           TELEGRAM_API_KEY,
           {
-            inline_keyboard: [[
-              { text: '➕ Group ထဲ ထည့်ရန်', url: `https://t.me/${botInfo.username}?startgroup=true` },
-            ], [
-              { text: '🆕 နောက်ထပ် Bot ဖန်တီးရန်', callback_data: 'create_bot' },
-            ]],
+            inline_keyboard: [
+              [{ text: '➕ Group ထဲ ထည့်ရန်', url: `https://t.me/${botInfo.username}?startgroup=true` }],
+              [{ text: '⚙️ Bot စီမံရန်', callback_data: `manage_bot:${targetBotId}` }],
+              [{ text: '🆕 နောက်ထပ် Bot ဖန်တီးရန်', callback_data: 'create_bot' }],
+            ],
           },
         );
 
-        await supabase
-          .from('bot1_conversations')
-          .update({ state: 'idle', updated_at: new Date().toISOString() })
-          .eq('chat_id', chatId);
-
+        await supabase.from('bot1_conversations').update({ state: 'idle', updated_at: new Date().toISOString() }).eq('chat_id', chatId);
         totalProcessed++;
       } catch (err) {
         console.error('Error processing update:', err);
@@ -392,10 +474,7 @@ Deno.serve(async (req) => {
     }
 
     const newOffset = Math.max(...updates.map((u: any) => u.update_id)) + 1;
-    await supabase
-      .from('bot1_state')
-      .update({ update_offset: newOffset, updated_at: new Date().toISOString() })
-      .eq('id', 1);
+    await supabase.from('bot1_state').update({ update_offset: newOffset, updated_at: new Date().toISOString() }).eq('id', 1);
     currentOffset = newOffset;
   }
 
@@ -404,12 +483,7 @@ Deno.serve(async (req) => {
   });
 });
 
-async function callGateway(
-  method: string,
-  payload: Record<string, unknown>,
-  LOVABLE_API_KEY: string,
-  TELEGRAM_API_KEY: string,
-) {
+async function callGateway(method: string, payload: Record<string, unknown>, LOVABLE_API_KEY: string, TELEGRAM_API_KEY: string) {
   const response = await fetch(`${GATEWAY_URL}/${method}`, {
     method: 'POST',
     headers: {
@@ -419,47 +493,26 @@ async function callGateway(
     },
     body: JSON.stringify(payload),
   });
-
   return response.json();
 }
 
-async function callTelegramDirect(
-  botToken: string,
-  method: string,
-  payload: Record<string, unknown>,
-) {
+async function callTelegramDirect(botToken: string, method: string, payload: Record<string, unknown>) {
   const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-
   return response.json();
 }
 
-async function editOrSendMessage(
-  chatId: number,
-  messageId: number | undefined,
-  text: string,
-  LOVABLE_API_KEY: string,
-  TELEGRAM_API_KEY: string,
-  replyMarkup?: unknown,
-) {
+async function editOrSendMessage(chatId: number, messageId: number | undefined, text: string, LOVABLE_API_KEY: string, TELEGRAM_API_KEY: string, replyMarkup?: unknown) {
   if (messageId) {
-    const body: Record<string, unknown> = {
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-    };
-
+    const body: Record<string, unknown> = { chat_id: chatId, message_id: messageId, text };
     if (replyMarkup) body.reply_markup = replyMarkup;
-
     await callGateway('editMessageText', body, LOVABLE_API_KEY, TELEGRAM_API_KEY);
     return;
   }
-
   const body: Record<string, unknown> = { chat_id: chatId, text };
   if (replyMarkup) body.reply_markup = replyMarkup;
-
   await callGateway('sendMessage', body, LOVABLE_API_KEY, TELEGRAM_API_KEY);
 }
