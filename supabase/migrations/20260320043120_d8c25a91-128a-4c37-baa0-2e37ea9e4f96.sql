@@ -1,0 +1,1 @@
+ALTER TABLE public.bots ADD COLUMN IF NOT EXISTS start_link text DEFAULT NULL;
