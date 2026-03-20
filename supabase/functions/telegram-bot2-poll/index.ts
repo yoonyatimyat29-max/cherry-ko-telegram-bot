@@ -9,11 +9,7 @@ const corsHeaders = {
 };
 
 type ContentKind = 'text' | 'sticker';
-
-type ParsedContent = {
-  kind: ContentKind;
-  value: string;
-};
+type ParsedContent = { kind: ContentKind; value: string };
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
@@ -28,7 +24,7 @@ Deno.serve(async (req) => {
 
   const { data: bots, error: botsErr } = await supabase
     .from('bots')
-    .select('id, api_key, bot_username')
+    .select('id, api_key, bot_username, start_link')
     .eq('is_active', true);
 
   if (botsErr || !bots?.length) {
@@ -39,11 +35,11 @@ Deno.serve(async (req) => {
 
   let totalProcessed = 0;
 
-  const { data: states } = await supabase
-    .from('bot2_states')
-    .select('bot_id, update_offset');
-
+  const { data: states } = await supabase.from('bot2_states').select('bot_id, update_offset');
   const stateMap = new Map((states || []).map((s) => [s.bot_id, s.update_offset]));
+
+  // Cache bot usernames for self-detection
+  const botUsernameSet = new Set(bots.map(b => b.bot_username?.toLowerCase()).filter(Boolean));
 
   while (true) {
     const elapsed = Date.now() - startTime;
@@ -53,30 +49,27 @@ Deno.serve(async (req) => {
     let anyUpdates = false;
 
     for (const bot of bots) {
+      if (Date.now() - startTime > MAX_RUNTIME_MS - MIN_REMAINING_MS) break;
+
       const offset = stateMap.get(bot.id) || 0;
 
       try {
         const data = await callTelegram(bot.api_key, 'getUpdates', {
           offset,
-          timeout: 1,
+          timeout: 2,
           allowed_updates: ['message'],
         });
 
         if (!data.ok) {
           const isConflict = String(data.error_code) === '409';
-          const isWebhookConflict = isConflict && String(data.description || '').toLowerCase().includes('webhook');
+          const desc = String(data.description || '').toLowerCase();
 
-          if (isWebhookConflict) {
-            const webhookResult = await callTelegram(bot.api_key, 'deleteWebhook', { drop_pending_updates: false });
-            if (webhookResult.ok) {
-              console.log(`Disabled webhook for @${bot.bot_username} and switched to polling`);
-            } else {
-              console.error(`Failed to disable webhook for @${bot.bot_username}:`, webhookResult);
-            }
+          if (isConflict && desc.includes('webhook')) {
+            const wr = await callTelegram(bot.api_key, 'deleteWebhook', { drop_pending_updates: false });
+            if (wr.ok) console.log(`Disabled webhook for @${bot.bot_username}`);
           } else if (!isConflict) {
             console.error(`Bot ${bot.bot_username} API error:`, data);
           }
-
           continue;
         }
 
@@ -88,11 +81,34 @@ Deno.serve(async (req) => {
         for (const update of updates) {
           try {
             const msg = update.message;
-            if (!msg || msg.from?.is_bot) continue;
+            if (!msg) continue;
+
+            // Handle /start command in private chat
+            if (msg.chat.type === 'private' && msg.text === '/start') {
+              const greeting = '👋 မင်္ဂလာပါ! ကျွန်တော်ကို Group ထဲထည့်ပြီး စကားပြောသင်ပေးပါ။\n\nGroup ထဲမှာ User တွေ Reply နဲ့ စကားပြောတာကို သင်ယူမှတ်သားပြီး ပြန်ပြောပေးပါမယ်။';
+
+              const keyboard: any[][] = [];
+              if (bot.start_link) {
+                keyboard.push([{ text: '📢 Channel / Group', url: bot.start_link }]);
+              }
+              keyboard.push([{ text: '➕ Group ထဲ ထည့်ရန်', url: `https://t.me/${bot.bot_username}?startgroup=true` }]);
+
+              await callTelegram(bot.api_key, 'sendMessage', {
+                chat_id: msg.chat.id,
+                text: greeting,
+                reply_markup: { inline_keyboard: keyboard },
+              });
+              totalProcessed++;
+              continue;
+            }
+
+            // Skip bot messages
+            if (msg.from?.is_bot) continue;
 
             const incomingContent = parseContentFromMessage(msg);
             if (!incomingContent) continue;
 
+            // Learning: only from user reply to another user's message
             if (msg.reply_to_message && !msg.reply_to_message.from?.is_bot) {
               const triggerContent = parseContentFromMessage(msg.reply_to_message);
 
@@ -100,49 +116,34 @@ Deno.serve(async (req) => {
                 const triggerKey = encodeContent(triggerContent);
                 const responseKey = encodeContent(incomingContent);
 
-                const { data: existing, error: existingErr } = await supabase
+                const { data: existing } = await supabase
                   .from('trigger_responses')
                   .select('id')
                   .eq('trigger_text', triggerKey)
                   .eq('response_text', responseKey)
                   .limit(1);
 
-                if (existingErr) {
-                  console.error('Error checking existing learning pair:', existingErr);
-                } else if (!existing || existing.length === 0) {
+                if (!existing || existing.length === 0) {
                   const { error: insertErr } = await supabase
                     .from('trigger_responses')
-                    .insert({
-                      bot_id: bot.id,
-                      trigger_text: triggerKey,
-                      response_text: responseKey,
-                    });
+                    .insert({ bot_id: bot.id, trigger_text: triggerKey, response_text: responseKey });
 
-                  if (insertErr) {
-                    console.error('Error inserting learning pair:', insertErr);
-                  } else {
-                    console.log(`Bot @${bot.bot_username} learned global pair: "${triggerKey}" -> "${responseKey}"`);
+                  if (!insertErr) {
+                    console.log(`@${bot.bot_username} learned: "${triggerKey}" -> "${responseKey}"`);
                   }
                 }
               }
-
-              totalProcessed++;
-              continue;
+              // Don't skip - also check if there's a response for this message
             }
 
+            // Response lookup: check if we have a learned response
             const triggerCandidates = buildTriggerCandidates(incomingContent, msg.text);
 
-            const { data: responses, error: responsesErr } = await supabase
+            const { data: responses } = await supabase
               .from('trigger_responses')
               .select('trigger_text, response_text, created_at')
               .in('trigger_text', triggerCandidates)
               .order('created_at', { ascending: true });
-
-            if (responsesErr) {
-              console.error('Error loading responses:', responsesErr);
-              totalProcessed++;
-              continue;
-            }
 
             if (responses && responses.length > 0) {
               let selectedGroup: Array<{ trigger_text: string; response_text: string }> = [];
@@ -187,13 +188,9 @@ Deno.serve(async (req) => {
                 const nextPointer = (currentPointer + 1) % selectedGroup.length;
                 await supabase
                   .from('trigger_pointers')
-                  .upsert({
-                    bot_id: bot.id,
-                    trigger_text: pointerKey,
-                    pointer: nextPointer,
-                  }, { onConflict: 'bot_id,trigger_text' });
+                  .upsert({ bot_id: bot.id, trigger_text: pointerKey, pointer: nextPointer }, { onConflict: 'bot_id,trigger_text' });
 
-                console.log(`Bot @${bot.bot_username} replied using global knowledge for "${pointerKey}"`);
+                console.log(`@${bot.bot_username} replied for "${pointerKey}"`);
               }
             }
 
@@ -206,20 +203,18 @@ Deno.serve(async (req) => {
         const newOffset = Math.max(...updates.map((u: any) => u.update_id)) + 1;
         stateMap.set(bot.id, newOffset);
 
-        await supabase
-          .from('bot2_states')
-          .upsert({
-            bot_id: bot.id,
-            update_offset: newOffset,
-            updated_at: new Date().toISOString(),
-          }, { onConflict: 'bot_id' });
+        await supabase.from('bot2_states').upsert({
+          bot_id: bot.id,
+          update_offset: newOffset,
+          updated_at: new Date().toISOString(),
+        }, { onConflict: 'bot_id' });
       } catch (err) {
         console.error(`Error polling bot ${bot.bot_username}:`, err);
       }
     }
 
     if (!anyUpdates) {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
 
@@ -228,17 +223,12 @@ Deno.serve(async (req) => {
   });
 });
 
-async function callTelegram(
-  botApiKey: string,
-  method: string,
-  payload: Record<string, unknown>,
-) {
+async function callTelegram(botApiKey: string, method: string, payload: Record<string, unknown>) {
   const response = await fetch(`https://api.telegram.org/bot${botApiKey}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-
   return response.json();
 }
 
@@ -246,11 +236,9 @@ function parseContentFromMessage(msg: any): ParsedContent | null {
   if (typeof msg?.text === 'string' && msg.text.trim().length > 0) {
     return { kind: 'text', value: normalizeText(msg.text) };
   }
-
   if (msg?.sticker?.file_id) {
     return { kind: 'sticker', value: msg.sticker.file_id };
   }
-
   return null;
 }
 
@@ -263,30 +251,19 @@ function encodeContent(content: ParsedContent): string {
 }
 
 function decodeContent(stored: string): ParsedContent {
-  if (stored.startsWith('text:')) {
-    return { kind: 'text', value: stored.slice(5) };
-  }
-
-  if (stored.startsWith('sticker:')) {
-    return { kind: 'sticker', value: stored.slice(8) };
-  }
-
+  if (stored.startsWith('text:')) return { kind: 'text', value: stored.slice(5) };
+  if (stored.startsWith('sticker:')) return { kind: 'sticker', value: stored.slice(8) };
   return { kind: 'text', value: stored };
 }
 
 function buildTriggerCandidates(content: ParsedContent, originalText?: string): string[] {
   const candidates = [encodeContent(content)];
-
   if (content.kind === 'text') {
     candidates.push(content.value);
-
     if (typeof originalText === 'string') {
-      const trimmedOriginal = originalText.trim();
-      if (trimmedOriginal.length > 0 && trimmedOriginal !== content.value) {
-        candidates.push(trimmedOriginal);
-      }
+      const trimmed = originalText.trim();
+      if (trimmed.length > 0 && trimmed !== content.value) candidates.push(trimmed);
     }
   }
-
   return Array.from(new Set(candidates));
 }

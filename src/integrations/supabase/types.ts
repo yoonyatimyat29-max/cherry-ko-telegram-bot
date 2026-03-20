@@ -91,6 +91,7 @@ export type Database = {
           id: string
           is_active: boolean
           owner_chat_id: number
+          start_link: string | null
         }
         Insert: {
           api_key: string
@@ -100,6 +101,7 @@ export type Database = {
           id?: string
           is_active?: boolean
           owner_chat_id: number
+          start_link?: string | null
         }
         Update: {
           api_key?: string
@@ -109,6 +111,7 @@ export type Database = {
           id?: string
           is_active?: boolean
           owner_chat_id?: number
+          start_link?: string | null
         }
         Relationships: []
       }
