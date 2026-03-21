@@ -167,7 +167,7 @@ Deno.serve(async (req) => {
               });
 
               // Small delay to simulate typing
-              await new Promise((resolve) => setTimeout(resolve, 800 + Math.random() * 1200));
+              await new Promise((resolve) => setTimeout(resolve, 300 + Math.random() * 700));
 
               if (selectedResponse.kind === 'sticker') {
                 await callTelegram(bot.api_key, 'sendSticker', {
