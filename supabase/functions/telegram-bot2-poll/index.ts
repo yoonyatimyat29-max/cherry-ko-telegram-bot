@@ -85,11 +85,11 @@ Deno.serve(async (req) => {
 
             // Handle /start command in private chat
             if (msg.chat.type === 'private' && msg.text === '/start') {
-              const greeting = '👋 မင်္ဂလာပါ! ကျွန်တော်ကို Group ထဲထည့်ပြီး စကားပြောသင်ပေးပါ။\n\nGroup ထဲမှာ User တွေ Reply နဲ့ စကားပြောတာကို သင်ယူမှတ်သားပြီး ပြန်ပြောပေးပါမယ်။';
+              const greeting = '👋 မင်္ဂလာပါ! Group ထဲထည့်ပေးပါ။\n\nGroup ထဲမှာ User တွေ Reply နဲ့ စကားပြန်ပြောပေးမယ်';
 
               const keyboard: any[][] = [];
               if (bot.start_link) {
-                keyboard.push([{ text: '📢 Channel / Group', url: bot.start_link }]);
+                keyboard.push([{ text: '📢 Join ပေးပါရန်', url: bot.start_link }]);
               }
               keyboard.push([{ text: '➕ Group ထဲ ထည့်ရန်', url: `https://t.me/${bot.bot_username}?startgroup=true` }]);
 
@@ -102,14 +102,14 @@ Deno.serve(async (req) => {
               continue;
             }
 
-            // Skip bot messages
-            if (msg.from?.is_bot) continue;
-
+            // Skip messages from bots (but we still learn from replies TO bot messages)
+            const isFromBot = msg.from?.is_bot;
+            
             const incomingContent = parseContentFromMessage(msg);
             if (!incomingContent) continue;
 
-            // Learning: only from user reply to another user's message
-            if (msg.reply_to_message && !msg.reply_to_message.from?.is_bot) {
+            // Learning: from user reply to another message (including bot messages)
+            if (msg.reply_to_message && !isFromBot) {
               const triggerContent = parseContentFromMessage(msg.reply_to_message);
 
               if (triggerContent) {
@@ -133,65 +133,62 @@ Deno.serve(async (req) => {
                   }
                 }
               }
-              // Don't skip - also check if there's a response for this message
             }
 
-            // Response lookup: check if we have a learned response
-            const triggerCandidates = buildTriggerCandidates(incomingContent, msg.text);
+            // Skip bot messages for response lookup
+            if (isFromBot) continue;
+
+            // Response lookup: EXACT match only using encoded content key
+            const exactKey = encodeContent(incomingContent);
 
             const { data: responses } = await supabase
               .from('trigger_responses')
               .select('trigger_text, response_text, created_at')
-              .in('trigger_text', triggerCandidates)
+              .eq('trigger_text', exactKey)
               .order('created_at', { ascending: true });
 
             if (responses && responses.length > 0) {
-              let selectedGroup: Array<{ trigger_text: string; response_text: string }> = [];
-              let pointerKey = triggerCandidates[0];
+              const { data: pointerData } = await supabase
+                .from('trigger_pointers')
+                .select('pointer')
+                .eq('bot_id', bot.id)
+                .eq('trigger_text', exactKey)
+                .single();
 
-              for (const candidate of triggerCandidates) {
-                const group = responses.filter((r) => r.trigger_text === candidate);
-                if (group.length > 0) {
-                  selectedGroup = group;
-                  pointerKey = candidate;
-                  break;
-                }
+              let currentPointer = pointerData?.pointer || 0;
+              if (currentPointer >= responses.length) currentPointer = 0;
+
+              const selectedResponse = decodeContent(responses[currentPointer].response_text);
+
+              // Send typing indicator
+              await callTelegram(bot.api_key, 'sendChatAction', {
+                chat_id: msg.chat.id,
+                action: selectedResponse.kind === 'sticker' ? 'choose_sticker' : 'typing',
+              });
+
+              // Small delay to simulate typing
+              await new Promise((resolve) => setTimeout(resolve, 800 + Math.random() * 1200));
+
+              if (selectedResponse.kind === 'sticker') {
+                await callTelegram(bot.api_key, 'sendSticker', {
+                  chat_id: msg.chat.id,
+                  sticker: selectedResponse.value,
+                  reply_to_message_id: msg.message_id,
+                });
+              } else {
+                await callTelegram(bot.api_key, 'sendMessage', {
+                  chat_id: msg.chat.id,
+                  text: selectedResponse.value,
+                  reply_to_message_id: msg.message_id,
+                });
               }
 
-              if (selectedGroup.length > 0) {
-                const { data: pointerData } = await supabase
-                  .from('trigger_pointers')
-                  .select('pointer')
-                  .eq('bot_id', bot.id)
-                  .eq('trigger_text', pointerKey)
-                  .single();
+              const nextPointer = (currentPointer + 1) % responses.length;
+              await supabase
+                .from('trigger_pointers')
+                .upsert({ bot_id: bot.id, trigger_text: exactKey, pointer: nextPointer }, { onConflict: 'bot_id,trigger_text' });
 
-                let currentPointer = pointerData?.pointer || 0;
-                if (currentPointer >= selectedGroup.length) currentPointer = 0;
-
-                const selectedResponse = decodeContent(selectedGroup[currentPointer].response_text);
-
-                if (selectedResponse.kind === 'sticker') {
-                  await callTelegram(bot.api_key, 'sendSticker', {
-                    chat_id: msg.chat.id,
-                    sticker: selectedResponse.value,
-                    reply_to_message_id: msg.message_id,
-                  });
-                } else {
-                  await callTelegram(bot.api_key, 'sendMessage', {
-                    chat_id: msg.chat.id,
-                    text: selectedResponse.value,
-                    reply_to_message_id: msg.message_id,
-                  });
-                }
-
-                const nextPointer = (currentPointer + 1) % selectedGroup.length;
-                await supabase
-                  .from('trigger_pointers')
-                  .upsert({ bot_id: bot.id, trigger_text: pointerKey, pointer: nextPointer }, { onConflict: 'bot_id,trigger_text' });
-
-                console.log(`@${bot.bot_username} replied for "${pointerKey}"`);
-              }
+              console.log(`@${bot.bot_username} replied for "${exactKey}"`);
             }
 
             totalProcessed++;
@@ -254,16 +251,4 @@ function decodeContent(stored: string): ParsedContent {
   if (stored.startsWith('text:')) return { kind: 'text', value: stored.slice(5) };
   if (stored.startsWith('sticker:')) return { kind: 'sticker', value: stored.slice(8) };
   return { kind: 'text', value: stored };
-}
-
-function buildTriggerCandidates(content: ParsedContent, originalText?: string): string[] {
-  const candidates = [encodeContent(content)];
-  if (content.kind === 'text') {
-    candidates.push(content.value);
-    if (typeof originalText === 'string') {
-      const trimmed = originalText.trim();
-      if (trimmed.length > 0 && trimmed !== content.value) candidates.push(trimmed);
-    }
-  }
-  return Array.from(new Set(candidates));
 }
