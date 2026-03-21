@@ -256,7 +256,10 @@ Deno.serve(async (req) => {
             if (!bot || String(bot.owner_chat_id) !== String(cbChatId)) {
               await callGateway('sendMessage', { chat_id: cbChatId, text: '❌ ဒီ Bot ကို ဖျက်ခွင့်မရှိပါ။' }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
             } else {
-              await supabase.from('bots').update({ is_active: false }).eq('id', botId);
+              // Delete related data first, then the bot itself
+              await supabase.from('trigger_pointers').delete().eq('bot_id', botId);
+              await supabase.from('bot2_states').delete().eq('bot_id', botId);
+              await supabase.from('bots').delete().eq('id', botId);
               await callGateway('sendMessage', {
                 chat_id: cbChatId,
                 text: `🗑 @${bot.bot_username || bot.bot_name} ကို ဖျက်ပြီးပါပြီ။`,
