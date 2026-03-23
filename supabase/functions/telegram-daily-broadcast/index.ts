@@ -59,18 +59,16 @@ async function processBotBroadcast(supabase: any, bot: any): Promise<number> {
   const groupChats = chats.filter((c: any) => c.chat_type !== 'private');
   const privateChats = chats.filter((c: any) => c.chat_type === 'private');
 
-  const groupLinkButtons = groupChats
-    .filter((g: any) => g.chat_username)
-    .map((g: any) => [{ text: `💬 ${g.chat_title || g.chat_username}`, url: `https://t.me/${g.chat_username}` }]);
-
   const sendJobs: Array<{ chatId: number; keyboard: any[][] }> = [];
 
   for (const chat of groupChats) {
     const keyboard = [...FIXED_BUTTONS];
-    for (const gb of groupLinkButtons) {
-      if (chat.chat_username && String(gb[0].url).includes(chat.chat_username)) continue;
-      keyboard.push(gb);
+
+    // Group broadcast တွေမှာတော့ လက်ရှိပို့နေတဲ့ group link တစ်ခုပဲ ထည့်ပို့မယ်
+    if (chat.chat_username) {
+      keyboard.push([{ text: `💬 ${chat.chat_title || chat.chat_username}`, url: `https://t.me/${chat.chat_username}` }]);
     }
+
     sendJobs.push({ chatId: chat.chat_id, keyboard });
   }
 
