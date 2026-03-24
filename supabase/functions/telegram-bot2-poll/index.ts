@@ -104,32 +104,41 @@ async function pollSingleBot(
 
         trackChat(supabase, bot.id, msg.chat, chatBotMap);
 
+        // Handle /start in private chat
         if (msg.chat.type === 'private' && msg.text === '/start') {
           await handleStart(bot, msg);
           processed++;
           continue;
         }
 
-        if (msg.photo || msg.video || msg.text || msg.sticker || msg.voice || msg.audio) {
-          reactToMessage(bot.api_key, msg.chat.id, msg.message_id);
-        }
-
         const isFromBot = msg.from?.is_bot;
         const incomingContent = parseContent(msg);
-        if (!incomingContent) continue;
 
-        if (msg.reply_to_message && !isFromBot) {
+        // Learn from replies (human replies only)
+        if (msg.reply_to_message && !isFromBot && incomingContent) {
           const triggerContent = parseContent(msg.reply_to_message);
           if (triggerContent) {
             await learnPair(supabase, bot.id, triggerContent, incomingContent, bot.bot_username);
           }
         }
 
+        // Skip bot messages entirely
         if (isFromBot) continue;
-        if (msg.chat.type === 'private' && !msg.reply_to_message) continue;
 
-        await hydrateChatBotsForChat(supabase, chatBotMap, msg.chat.id);
-        if (!shouldCurrentBotRespond(chatBotMap, bot.id, msg.chat.id, msg.message_id)) continue;
+        // Determine turn-taking for groups with multiple bots
+        const isGroup = msg.chat.type !== 'private';
+        if (isGroup) {
+          await hydrateChatBotsForChat(supabase, chatBotMap, msg.chat.id);
+          if (!shouldCurrentBotRespond(chatBotMap, bot.id, msg.chat.id, msg.message_id)) continue;
+        }
+
+        // React to media/text (only if this bot's turn, or single bot, or private)
+        if (msg.photo || msg.video || msg.text || msg.sticker || msg.voice || msg.audio) {
+          reactToMessage(bot.api_key, msg.chat.id, msg.message_id);
+        }
+
+        // Try to respond if we have content to match
+        if (!incomingContent) continue;
 
         const exactKey = encodeContent(incomingContent);
         await tryRespond(supabase, bot, msg, exactKey, highLoad);
@@ -286,7 +295,7 @@ async function tryRespond(supabase: any, bot: BotRow, msg: any, exactKey: string
   const selected = decodeContent(responses[ptr].response_text);
   const action = selected.kind === 'sticker' ? 'choose_sticker' : 'typing';
   callTelegram(bot.api_key, 'sendChatAction', { chat_id: msg.chat.id, action }).catch(() => {});
-  await delay(highLoad ? 40 + Math.random() * 100 : 120 + Math.random() * 250);
+  await delay(highLoad ? 30 + Math.random() * 70 : 80 + Math.random() * 150);
 
   if (selected.kind === 'sticker') {
     await callTelegram(bot.api_key, 'sendSticker', {

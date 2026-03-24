@@ -1,6 +1,7 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 const TELEGRAM_TIMEOUT_MS = 10_000;
+const BATCH_SIZE = 30;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -48,39 +49,54 @@ Deno.serve(async (req) => {
 });
 
 async function processBotBroadcast(supabase: any, bot: any): Promise<number> {
-  const { data: chats } = await supabase
-    .from('bot_chats')
-    .select('chat_id, chat_title, chat_type, chat_username')
-    .eq('bot_id', bot.id)
-    .eq('is_active', true);
+  // Fetch ALL chats using pagination to handle 10000+ users
+  const allChats: any[] = [];
+  let from = 0;
+  const pageSize = 1000;
 
-  if (!chats?.length) return 0;
+  while (true) {
+    const { data: chats, error } = await supabase
+      .from('bot_chats')
+      .select('chat_id, chat_title, chat_type, chat_username')
+      .eq('bot_id', bot.id)
+      .eq('is_active', true)
+      .range(from, from + pageSize - 1);
 
-  const groupChats = chats.filter((c: any) => c.chat_type !== 'private');
-  const privateChats = chats.filter((c: any) => c.chat_type === 'private');
+    if (error || !chats?.length) break;
+    allChats.push(...chats);
+    if (chats.length < pageSize) break;
+    from += pageSize;
+  }
+
+  if (!allChats.length) return 0;
+
+  const groupChats = allChats.filter((c: any) => c.chat_type !== 'private');
+  const privateChats = allChats.filter((c: any) => c.chat_type === 'private');
+
+  console.log(`@${bot.bot_username}: ${groupChats.length} groups, ${privateChats.length} private chats`);
 
   const sendJobs: Array<{ chatId: number; keyboard: any[][] }> = [];
 
+  // Group chats: fixed buttons + current group's own link only
   for (const chat of groupChats) {
     const keyboard = [...FIXED_BUTTONS];
-
-    // Group broadcast တွေမှာတော့ လက်ရှိပို့နေတဲ့ group link တစ်ခုပဲ ထည့်ပို့မယ်
     if (chat.chat_username) {
       keyboard.push([{ text: `💬 ${chat.chat_title || chat.chat_username}`, url: `https://t.me/${chat.chat_username}` }]);
     }
-
     sendJobs.push({ chatId: chat.chat_id, keyboard });
   }
 
+  // Private chats: fixed buttons only (no group links)
   for (const chat of privateChats) {
     sendJobs.push({ chatId: chat.chat_id, keyboard: [...FIXED_BUTTONS] });
   }
 
-  return sendInBatches(bot.api_key, sendJobs, 20);
+  return sendInBatches(bot.api_key, bot.bot_username, sendJobs, BATCH_SIZE);
 }
 
 async function sendInBatches(
   apiKey: string,
+  botUsername: string,
   jobs: Array<{ chatId: number; keyboard: any[][] }>,
   chunkSize: number,
 ): Promise<number> {
@@ -103,8 +119,14 @@ async function sendInBatches(
         sent++;
       }
     }
+
+    // Rate limit: Telegram allows ~30 msgs/sec
+    if (i + chunkSize < jobs.length) {
+      await new Promise((r) => setTimeout(r, 1100));
+    }
   }
 
+  console.log(`@${botUsername}: broadcast sent to ${sent}/${jobs.length}`);
   return sent;
 }
 
