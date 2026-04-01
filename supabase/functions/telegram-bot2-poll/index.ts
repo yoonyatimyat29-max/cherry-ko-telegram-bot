@@ -3,7 +3,8 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 const MAX_RUNTIME_MS = 55_000;
 const MIN_REMAINING_MS = 5_000;
 const TELEGRAM_TIMEOUT_MS = 8_000;
-const CHAT_MAP_REFRESH_MS = 15_000;
+const IDLE_DELAY_MS = 150;
+const BOT_POLL_CONCURRENCY = 12;
 const REACTION_EMOJIS = ['❤️', '🔥', '👍', '😂', '🎉', '❤️‍🔥', '💯', '😍', '👏', '🤩'];
 
 const corsHeaders = {
@@ -14,6 +15,17 @@ const corsHeaders = {
 type ContentKind = 'text' | 'sticker' | 'voice';
 type ParsedContent = { kind: ContentKind; value: string };
 type BotRow = { id: string; api_key: string; bot_username: string | null; start_link: string | null };
+type ChatRecord = {
+  bot_id: string;
+  chat_id: number;
+  chat_title: string | null;
+  chat_type: string;
+  chat_username: string | null;
+  is_active: boolean;
+  updated_at: string;
+};
+type PollResult = { processed: number; hadUpdates: boolean };
+type LearnedPair = { triggerKey: string; responseKey: string };
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
@@ -22,50 +34,65 @@ Deno.serve(async (req) => {
 
   const startTime = Date.now();
   const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+  const shardConfig = await readShardConfig(req);
 
-  const { data: bots, error: botsErr } = await supabase
+  const { data: allBots, error: botsErr } = await supabase
     .from('bots')
     .select('id, api_key, bot_username, start_link')
-    .eq('is_active', true);
+    .eq('is_active', true)
+    .order('created_at', { ascending: true });
 
-  if (botsErr || !bots?.length) {
+  const bots = (allBots || []).filter((_, index) => index % shardConfig.shards === shardConfig.shard);
+
+  if (botsErr || !bots.length) {
     return new Response(JSON.stringify({ ok: true, message: 'No active bots' }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
 
   const { data: states } = await supabase.from('bot2_states').select('bot_id, update_offset');
-  const stateMap = new Map((states || []).map((s: any) => [s.bot_id, s.update_offset]));
+  const stateMap = new Map((states || []).map((state: any) => [state.bot_id, state.update_offset]));
+  const chatBotMap = new Map<number, string[]>();
+  const responseCache = new Map<string, string[]>();
+  const pointerCache = new Map<string, number>();
 
-  let chatBotMap = await loadChatBotMap(supabase, bots.map((b: BotRow) => b.id));
-  let lastChatMapRefresh = Date.now();
   let totalProcessed = 0;
 
   while (true) {
     const remaining = MAX_RUNTIME_MS - (Date.now() - startTime);
     if (remaining < MIN_REMAINING_MS) break;
 
-    if (Date.now() - lastChatMapRefresh >= CHAT_MAP_REFRESH_MS) {
-      chatBotMap = await loadChatBotMap(supabase, bots.map((b: BotRow) => b.id));
-      lastChatMapRefresh = Date.now();
-    }
-
-    const results = await Promise.all(
-      bots.map((bot: BotRow) => pollSingleBot(bot, stateMap, chatBotMap, supabase))
-    );
-
     let anyUpdates = false;
-    for (const r of results) {
-      totalProcessed += r.processed;
-      if (r.processed > 0) anyUpdates = true;
+
+    for (const batch of chunkArray(bots, BOT_POLL_CONCURRENCY)) {
+      const results = await Promise.allSettled(
+        batch.map((bot) => pollSingleBot(bot, stateMap, chatBotMap, responseCache, pointerCache, supabase))
+      );
+
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          totalProcessed += result.value.processed;
+          if (result.value.hadUpdates) anyUpdates = true;
+        } else {
+          console.error('Bot batch error:', result.reason);
+        }
+      }
+
+      if (MAX_RUNTIME_MS - (Date.now() - startTime) < MIN_REMAINING_MS) break;
     }
 
     if (!anyUpdates) {
-      await delay(300);
+      await delay(IDLE_DELAY_MS);
     }
   }
 
-  return new Response(JSON.stringify({ ok: true, processed: totalProcessed, bots: bots.length }), {
+  return new Response(JSON.stringify({
+    ok: true,
+    processed: totalProcessed,
+    bots: bots.length,
+    shard: shardConfig.shard,
+    shards: shardConfig.shards,
+  }), {
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
   });
 });
@@ -74,8 +101,10 @@ async function pollSingleBot(
   bot: BotRow,
   stateMap: Map<string, number>,
   chatBotMap: Map<number, string[]>,
+  responseCache: Map<string, string[]>,
+  pointerCache: Map<string, number>,
   supabase: any,
-): Promise<{ processed: number }> {
+): Promise<PollResult> {
   let processed = 0;
   const offset = stateMap.get(bot.id) || 0;
 
@@ -90,65 +119,91 @@ async function pollSingleBot(
       if (String(data.error_code) === '409' && String(data.description || '').toLowerCase().includes('webhook')) {
         await callTelegram(bot.api_key, 'deleteWebhook', { drop_pending_updates: false });
       }
-      return { processed: 0 };
+      return { processed: 0, hadUpdates: false };
     }
 
-    const updates = data.result ?? [];
-    if (updates.length === 0) return { processed: 0 };
+    const updates = Array.isArray(data.result) ? data.result : [];
+    if (updates.length === 0) {
+      return { processed: 0, hadUpdates: false };
+    }
+
+    const messages = updates.map((update: any) => update.message).filter(Boolean);
+    const chatRecords = collectChatRecords(bot.id, messages, chatBotMap);
+    const learnedPairs = collectLearnedPairs(messages);
     const highLoad = updates.length >= 15;
+
+    if (learnedPairs.length > 0) {
+      await learnPairsBatch(supabase, bot.id, learnedPairs, bot.bot_username, responseCache);
+    }
+
+    const exactKeys = Array.from(new Set(
+      messages
+        .map((message: any) => parseContent(message))
+        .filter(Boolean)
+        .map((content: ParsedContent | null) => encodeContent(content!))
+    ));
+
+    if (exactKeys.length > 0) {
+      await warmCaches(supabase, bot.id, exactKeys, responseCache, pointerCache);
+    }
+
+    const pointerUpdates = new Map<string, number>();
 
     for (const update of updates) {
       try {
         const msg = update.message;
         if (!msg) continue;
 
-        trackChat(supabase, bot.id, msg.chat, chatBotMap);
-
-        // Handle /start in private chat
         if (msg.chat.type === 'private' && msg.text === '/start') {
           await handleStart(bot, msg);
           processed++;
           continue;
         }
 
-        const isFromBot = msg.from?.is_bot;
-        const incomingContent = parseContent(msg);
+        if (msg.from?.is_bot) continue;
 
-        // Learn from replies (human replies only)
-        if (msg.reply_to_message && !isFromBot && incomingContent) {
-          const triggerContent = parseContent(msg.reply_to_message);
-          if (triggerContent) {
-            await learnPair(supabase, bot.id, triggerContent, incomingContent, bot.bot_username);
-          }
-        }
-
-        // Skip bot messages entirely
-        if (isFromBot) continue;
-
-        // Determine turn-taking for groups with multiple bots
         const isGroup = msg.chat.type !== 'private';
         if (isGroup) {
-          await hydrateChatBotsForChat(supabase, chatBotMap, msg.chat.id);
+          await hydrateChatBotsForChat(supabase, chatBotMap, msg.chat.id, bot.id);
           if (!shouldCurrentBotRespond(chatBotMap, bot.id, msg.chat.id, msg.message_id)) continue;
         }
 
-        // React to media/text (only if this bot's turn, or single bot, or private)
         if (msg.photo || msg.video || msg.text || msg.sticker || msg.voice || msg.audio) {
           reactToMessage(bot.api_key, msg.chat.id, msg.message_id);
         }
 
-        // Try to respond if we have content to match
+        const incomingContent = parseContent(msg);
         if (!incomingContent) continue;
 
         const exactKey = encodeContent(incomingContent);
-        await tryRespond(supabase, bot, msg, exactKey, highLoad);
-        processed++;
+        const responded = await tryRespond(
+          supabase,
+          bot,
+          msg,
+          exactKey,
+          highLoad,
+          responseCache,
+          pointerCache,
+          pointerUpdates,
+        );
+
+        if (responded) {
+          processed++;
+        }
       } catch (err) {
         console.error('Msg error:', err);
       }
     }
 
-    const newOffset = Math.max(...updates.map((u: any) => u.update_id)) + 1;
+    if (chatRecords.length > 0) {
+      await upsertChats(supabase, chatRecords);
+    }
+
+    if (pointerUpdates.size > 0) {
+      await persistPointerUpdates(supabase, bot.id, pointerUpdates);
+    }
+
+    const newOffset = Math.max(...updates.map((update: any) => update.update_id)) + 1;
     stateMap.set(bot.id, newOffset);
     await supabase.from('bot2_states').upsert(
       { bot_id: bot.id, update_offset: newOffset, updated_at: new Date().toISOString() },
@@ -158,7 +213,7 @@ async function pollSingleBot(
     console.error(`Poll error @${bot.bot_username}:`, err);
   }
 
-  return { processed };
+  return { processed, hadUpdates: true };
 }
 
 async function handleStart(bot: BotRow, msg: any) {
@@ -175,68 +230,72 @@ async function handleStart(bot: BotRow, msg: any) {
   });
 }
 
-function trackChat(supabase: any, botId: string, chat: any, chatBotMap: Map<number, string[]>) {
-  if (!chat) return;
+function collectChatRecords(botId: string, messages: any[], chatBotMap: Map<number, string[]>) {
+  const records = new Map<string, ChatRecord>();
 
-  const chatId = Number(chat.id);
-  if (Number.isFinite(chatId)) {
-    const existing = chatBotMap.get(chatId) ?? [];
-    if (!existing.includes(botId)) {
-      existing.push(botId);
-      existing.sort();
-      chatBotMap.set(chatId, existing);
+  for (const msg of messages) {
+    const chat = msg?.chat;
+    if (!chat) continue;
+
+    const chatId = Number(chat.id);
+    if (Number.isFinite(chatId)) {
+      const existing = chatBotMap.get(chatId) ?? [];
+      if (!existing.includes(botId)) {
+        existing.push(botId);
+        existing.sort();
+        chatBotMap.set(chatId, existing);
+      }
     }
+
+    const key = `${botId}:${chat.id}`;
+    records.set(key, {
+      bot_id: botId,
+      chat_id: chat.id,
+      chat_title: chat.title || chat.first_name || null,
+      chat_type: chat.type,
+      chat_username: chat.username || null,
+      is_active: true,
+      updated_at: new Date().toISOString(),
+    });
   }
 
-  supabase.from('bot_chats').upsert({
-    bot_id: botId,
-    chat_id: chat.id,
-    chat_title: chat.title || chat.first_name || null,
-    chat_type: chat.type,
-    chat_username: chat.username || null,
-    is_active: true,
-    updated_at: new Date().toISOString(),
-  }, { onConflict: 'bot_id,chat_id' }).then(() => {}).catch(() => {});
+  return Array.from(records.values());
 }
 
-async function loadChatBotMap(supabase: any, botIds: string[]) {
-  const chatBotMap = new Map<number, string[]>();
-  if (!botIds.length) return chatBotMap;
-
-  const { data: rows } = await supabase
-    .from('bot_chats')
-    .select('chat_id, bot_id')
-    .in('bot_id', botIds)
-    .eq('is_active', true);
-
-  for (const row of rows || []) {
-    const chatId = Number(row.chat_id);
-    if (!Number.isFinite(chatId)) continue;
-
-    const existing = chatBotMap.get(chatId) ?? [];
-    if (!existing.includes(row.bot_id)) {
-      existing.push(row.bot_id);
-      existing.sort();
-      chatBotMap.set(chatId, existing);
-    }
+async function upsertChats(supabase: any, rows: ChatRecord[]) {
+  const { error } = await supabase.from('bot_chats').upsert(rows, { onConflict: 'bot_id,chat_id' });
+  if (error) {
+    console.error('bot_chats upsert failed:', error);
   }
-
-  return chatBotMap;
 }
 
-async function hydrateChatBotsForChat(supabase: any, chatBotMap: Map<number, string[]>, chatIdRaw: number) {
+async function hydrateChatBotsForChat(
+  supabase: any,
+  chatBotMap: Map<number, string[]>,
+  chatIdRaw: number,
+  currentBotId: string,
+) {
   const chatId = Number(chatIdRaw);
   if (!Number.isFinite(chatId)) return;
-  if (chatBotMap.has(chatId)) return;
 
-  const { data: rows } = await supabase
-    .from('bot_chats')
-    .select('bot_id')
-    .eq('chat_id', chatId)
-    .eq('is_active', true);
+  if (!chatBotMap.has(chatId)) {
+    const { data: rows } = await supabase
+      .from('bot_chats')
+      .select('bot_id')
+      .eq('chat_id', chatId)
+      .eq('is_active', true);
 
-  const botIds = Array.from(new Set((rows || []).map((r: any) => r.bot_id))).sort();
-  chatBotMap.set(chatId, botIds);
+    const botIds = Array.from(new Set((rows || []).map((row: any) => row.bot_id).concat(currentBotId))).sort();
+    chatBotMap.set(chatId, botIds);
+    return;
+  }
+
+  const existing = chatBotMap.get(chatId) ?? [];
+  if (!existing.includes(currentBotId)) {
+    existing.push(currentBotId);
+    existing.sort();
+    chatBotMap.set(chatId, existing);
+  }
 }
 
 function shouldCurrentBotRespond(chatBotMap: Map<number, string[]>, currentBotId: string, chatIdRaw: number, messageIdRaw: number) {
@@ -251,75 +310,190 @@ function shouldCurrentBotRespond(chatBotMap: Map<number, string[]>, currentBotId
   return botIds[turnIndex] === currentBotId;
 }
 
-async function learnPair(supabase: any, botId: string, trigger: ParsedContent, response: ParsedContent, botUsername: string | null) {
-  const triggerKey = encodeContent(trigger);
-  const responseKey = encodeContent(response);
+function collectLearnedPairs(messages: any[]): LearnedPair[] {
+  const uniquePairs = new Map<string, LearnedPair>();
 
-  const { data: existing } = await supabase
+  for (const msg of messages) {
+    if (msg?.from?.is_bot) continue;
+    if (!msg?.reply_to_message) continue;
+
+    const triggerContent = parseContent(msg.reply_to_message);
+    const responseContent = parseContent(msg);
+    if (!triggerContent || !responseContent) continue;
+
+    const triggerKey = encodeContent(triggerContent);
+    const responseKey = encodeContent(responseContent);
+    uniquePairs.set(`${triggerKey}=>${responseKey}`, { triggerKey, responseKey });
+  }
+
+  return Array.from(uniquePairs.values());
+}
+
+async function learnPairsBatch(
+  supabase: any,
+  botId: string,
+  pairs: LearnedPair[],
+  botUsername: string | null,
+  responseCache: Map<string, string[]>,
+) {
+  const triggerKeys = Array.from(new Set(pairs.map((pair) => pair.triggerKey)));
+  if (triggerKeys.length === 0) return;
+
+  const { data: existingRows, error: existingError } = await supabase
     .from('trigger_responses')
-    .select('id')
-    .eq('trigger_text', triggerKey)
-    .eq('response_text', responseKey)
-    .limit(1);
+    .select('trigger_text, response_text')
+    .in('trigger_text', triggerKeys);
 
-  if (!existing || existing.length === 0) {
-    const { error } = await supabase
-      .from('trigger_responses')
-      .insert({ bot_id: botId, trigger_text: triggerKey, response_text: responseKey });
-    if (!error) {
-      console.log(`@${botUsername} learned: "${triggerKey}" -> "${responseKey}"`);
+  if (existingError) {
+    console.error('Failed to check existing learned pairs:', existingError);
+    return;
+  }
+
+  const existingPairs = new Set(
+    (existingRows || []).map((row: any) => `${row.trigger_text}=>${row.response_text}`)
+  );
+
+  const inserts = pairs
+    .filter((pair) => !existingPairs.has(`${pair.triggerKey}=>${pair.responseKey}`))
+    .map((pair) => ({
+      bot_id: botId,
+      trigger_text: pair.triggerKey,
+      response_text: pair.responseKey,
+    }));
+
+  if (inserts.length === 0) return;
+
+  const { error } = await supabase.from('trigger_responses').insert(inserts);
+  if (error) {
+    console.error('Failed to insert learned pairs:', error);
+    return;
+  }
+
+  for (const pair of pairs) {
+    const cachedResponses = responseCache.get(pair.triggerKey);
+    if (cachedResponses && !cachedResponses.includes(pair.responseKey)) {
+      cachedResponses.push(pair.responseKey);
     }
+    console.log(`@${botUsername} learned: "${pair.triggerKey}" -> "${pair.responseKey}"`);
   }
 }
 
-async function tryRespond(supabase: any, bot: BotRow, msg: any, exactKey: string, highLoad: boolean) {
-  const [{ data: responses }, { data: pointerData }] = await Promise.all([
-    supabase
+async function warmCaches(
+  supabase: any,
+  botId: string,
+  exactKeys: string[],
+  responseCache: Map<string, string[]>,
+  pointerCache: Map<string, number>,
+) {
+  const missingResponseKeys = exactKeys.filter((key) => !responseCache.has(key));
+  if (missingResponseKeys.length > 0) {
+    for (const key of missingResponseKeys) {
+      responseCache.set(key, []);
+    }
+
+    const { data: responseRows, error } = await supabase
       .from('trigger_responses')
-      .select('response_text, created_at')
-      .eq('trigger_text', exactKey)
-      .order('created_at', { ascending: true }),
-    supabase
-      .from('trigger_pointers')
-      .select('pointer')
-      .eq('bot_id', bot.id)
-      .eq('trigger_text', exactKey)
-      .single(),
-  ]);
+      .select('trigger_text, response_text, created_at')
+      .in('trigger_text', missingResponseKeys)
+      .order('created_at', { ascending: true });
 
-  if (!responses || responses.length === 0) return;
+    if (error) {
+      console.error('Failed to warm response cache:', error);
+    } else {
+      for (const row of responseRows || []) {
+        const existing = responseCache.get(row.trigger_text) ?? [];
+        existing.push(row.response_text);
+        responseCache.set(row.trigger_text, existing);
+      }
+    }
+  }
 
-  let ptr = pointerData?.pointer || 0;
+  const missingPointerKeys = exactKeys.filter((key) => !pointerCache.has(pointerCacheKey(botId, key)));
+  if (missingPointerKeys.length === 0) return;
+
+  for (const key of missingPointerKeys) {
+    pointerCache.set(pointerCacheKey(botId, key), 0);
+  }
+
+  const { data: pointerRows, error } = await supabase
+    .from('trigger_pointers')
+    .select('trigger_text, pointer')
+    .eq('bot_id', botId)
+    .in('trigger_text', missingPointerKeys);
+
+  if (error) {
+    console.error('Failed to warm pointer cache:', error);
+    return;
+  }
+
+  for (const row of pointerRows || []) {
+    pointerCache.set(pointerCacheKey(botId, row.trigger_text), row.pointer || 0);
+  }
+}
+
+async function tryRespond(
+  supabase: any,
+  bot: BotRow,
+  msg: any,
+  exactKey: string,
+  highLoad: boolean,
+  responseCache: Map<string, string[]>,
+  pointerCache: Map<string, number>,
+  pointerUpdates: Map<string, number>,
+) {
+  const responses = responseCache.get(exactKey) ?? [];
+  if (responses.length === 0) return false;
+
+  const cacheKey = pointerCacheKey(bot.id, exactKey);
+  let ptr = pointerUpdates.get(exactKey) ?? pointerCache.get(cacheKey) ?? 0;
   if (ptr >= responses.length) ptr = 0;
 
-  const selected = decodeContent(responses[ptr].response_text);
+  const selected = decodeContent(responses[ptr]);
   const action = selected.kind === 'sticker' ? 'choose_sticker' : 'typing';
   callTelegram(bot.api_key, 'sendChatAction', { chat_id: msg.chat.id, action }).catch(() => {});
-  await delay(highLoad ? 30 + Math.random() * 70 : 80 + Math.random() * 150);
+  await delay(highLoad ? 20 + Math.random() * 40 : 45 + Math.random() * 90);
 
   if (selected.kind === 'sticker') {
     await callTelegram(bot.api_key, 'sendSticker', {
-      chat_id: msg.chat.id, sticker: selected.value,
-      reply_to_message_id: msg.message_id, allow_sending_without_reply: true,
+      chat_id: msg.chat.id,
+      sticker: selected.value,
+      reply_to_message_id: msg.message_id,
+      allow_sending_without_reply: true,
     });
   } else if (selected.kind === 'voice') {
     await callTelegram(bot.api_key, 'sendVoice', {
-      chat_id: msg.chat.id, voice: selected.value,
-      reply_to_message_id: msg.message_id, allow_sending_without_reply: true,
+      chat_id: msg.chat.id,
+      voice: selected.value,
+      reply_to_message_id: msg.message_id,
+      allow_sending_without_reply: true,
     });
   } else {
     await callTelegram(bot.api_key, 'sendMessage', {
-      chat_id: msg.chat.id, text: selected.value,
-      reply_to_message_id: msg.message_id, allow_sending_without_reply: true,
+      chat_id: msg.chat.id,
+      text: selected.value,
+      reply_to_message_id: msg.message_id,
+      allow_sending_without_reply: true,
     });
   }
 
   const nextPtr = (ptr + 1) % responses.length;
-  await supabase.from('trigger_pointers').upsert(
-    { bot_id: bot.id, trigger_text: exactKey, pointer: nextPtr },
-    { onConflict: 'bot_id,trigger_text' }
-  );
+  pointerCache.set(cacheKey, nextPtr);
+  pointerUpdates.set(exactKey, nextPtr);
   console.log(`@${bot.bot_username} replied for "${exactKey}"`);
+  return true;
+}
+
+async function persistPointerUpdates(supabase: any, botId: string, pointerUpdates: Map<string, number>) {
+  const rows = Array.from(pointerUpdates.entries()).map(([trigger_text, pointer]) => ({
+    bot_id: botId,
+    trigger_text,
+    pointer,
+  }));
+
+  const { error } = await supabase.from('trigger_pointers').upsert(rows, { onConflict: 'bot_id,trigger_text' });
+  if (error) {
+    console.error('Failed to persist trigger pointers:', error);
+  }
 }
 
 function reactToMessage(apiKey: string, chatId: number, messageId: number) {
@@ -372,8 +546,8 @@ function parseContent(msg: any): ParsedContent | null {
   return null;
 }
 
-function encodeContent(c: ParsedContent): string {
-  return `${c.kind}:${c.value}`;
+function encodeContent(content: ParsedContent): string {
+  return `${content.kind}:${content.value}`;
 }
 
 function decodeContent(stored: string): ParsedContent {
@@ -381,6 +555,33 @@ function decodeContent(stored: string): ParsedContent {
   if (stored.startsWith('sticker:')) return { kind: 'sticker', value: stored.slice(8) };
   if (stored.startsWith('voice:')) return { kind: 'voice', value: stored.slice(6) };
   return { kind: 'text', value: stored };
+}
+
+function pointerCacheKey(botId: string, triggerKey: string) {
+  return `${botId}:${triggerKey}`;
+}
+
+async function readShardConfig(req: Request) {
+  if (req.method !== 'POST') {
+    return { shard: 0, shards: 1 };
+  }
+
+  try {
+    const body = await req.json();
+    const shards = Math.max(1, Math.min(32, Number(body?.shards) || 1));
+    const shard = Math.max(0, Math.min(shards - 1, Number(body?.shard) || 0));
+    return { shard, shards };
+  } catch {
+    return { shard: 0, shards: 1 };
+  }
+}
+
+function chunkArray<T>(items: T[], size: number) {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
 }
 
 function delay(ms: number) {
