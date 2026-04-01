@@ -4,15 +4,18 @@ import { Bot, MessageSquare, Users, Zap, ArrowRight } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
 const Index = () => {
-  const { data: bots, isLoading: botsLoading } = useQuery({
+  const { data: bots, isLoading: botsLoading, isError: botsError } = useQuery({
     queryKey: ["bots-count"],
     queryFn: async () => {
-      const { count } = await supabase
+      const { count, error } = await supabase
         .from("bots" as any)
         .select("*", { count: "exact", head: true })
         .eq("is_active", true);
+
+      if (error) throw error;
       return count || 0;
     },
+    retry: 1,
   });
 
   const { data: pairsCount } = useQuery({
@@ -67,7 +70,7 @@ const Index = () => {
             <CardContent>
               <div className="flex items-center gap-2">
                 <Bot className="h-5 w-5 text-primary" />
-                <span className="text-2xl font-bold text-foreground">{botsLoading ? "..." : bots}</span>
+                <span className="text-2xl font-bold text-foreground">{botsLoading ? "..." : botsError ? "0" : bots}</span>
               </div>
             </CardContent>
           </Card>
