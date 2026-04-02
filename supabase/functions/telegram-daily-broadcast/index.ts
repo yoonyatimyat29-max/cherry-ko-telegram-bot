@@ -13,7 +13,7 @@ const BROADCAST_TEXT = 'ကျွန်တော်တို့ရဲ့ Group �
 const FIXED_BUTTONS = [
   [{ text: 'The Bot Bar 🤖', url: 'https://t.me/Cherry_Ko_official' }],
   [{ text: 'official Group Join ပေးပါ', url: 'https://t.me/HeartopiaGroups' }],
-  [{ text: 'DENSTAR1K 💖', url: 'https://t.me/addlist/pOfGHQLDBPY3ZjM9' }],
+  [{ text: '𝐒𝐭𝐚𝐫𝐝𝐮𝐬𝐭 𝐋𝐨𝐯𝐞 ᰔ', url: 'https://t.me/Stardust_Love2026' }],
 ];
 
 Deno.serve(async (req) => {
@@ -49,7 +49,7 @@ Deno.serve(async (req) => {
 });
 
 async function processBotBroadcast(supabase: any, bot: any): Promise<number> {
-  // Fetch ALL chats using pagination to handle 10000+ users
+  // Fetch ALL chats (including inactive) to reach every user who ever started the bot
   const allChats: any[] = [];
   let from = 0;
   const pageSize = 1000;
@@ -59,7 +59,6 @@ async function processBotBroadcast(supabase: any, bot: any): Promise<number> {
       .from('bot_chats')
       .select('chat_id, chat_title, chat_type, chat_username')
       .eq('bot_id', bot.id)
-      .eq('is_active', true)
       .range(from, from + pageSize - 1);
 
     if (error || !chats?.length) break;
@@ -120,7 +119,6 @@ async function sendInBatches(
       }
     }
 
-    // Rate limit: Telegram allows ~30 msgs/sec
     if (i + chunkSize < jobs.length) {
       await new Promise((r) => setTimeout(r, 1100));
     }
