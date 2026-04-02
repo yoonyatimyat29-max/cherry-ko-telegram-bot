@@ -7,6 +7,10 @@ const IDLE_DELAY_MS = 150;
 const BOT_POLL_CONCURRENCY = 12;
 const REACTION_EMOJIS = ['❤️', '🔥', '👍', '😂', '🎉', '❤️‍🔥', '💯', '😍', '👏', '🤩'];
 
+// Owner's channel - only this channel is allowed for forwarding
+const OWNER_CHANNEL_ID = -1002793957022;
+const OWNER_CHANNEL_USERNAME = 'Stardust_Love2026';
+
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -42,7 +46,7 @@ Deno.serve(async (req) => {
     .eq('is_active', true)
     .order('created_at', { ascending: true });
 
-  const bots = (allBots || []).filter((_, index) => index % shardConfig.shards === shardConfig.shard);
+  const bots = (allBots || []).filter((_: any, index: number) => index % shardConfig.shards === shardConfig.shard);
 
   if (botsErr || !bots.length) {
     return new Response(JSON.stringify({ ok: true, message: 'No active bots' }), {
@@ -66,7 +70,7 @@ Deno.serve(async (req) => {
 
     for (const batch of chunkArray(bots, BOT_POLL_CONCURRENCY)) {
       const results = await Promise.allSettled(
-        batch.map((bot) => pollSingleBot(bot, stateMap, chatBotMap, responseCache, pointerCache, supabase))
+        batch.map((bot: BotRow) => pollSingleBot(bot, stateMap, chatBotMap, responseCache, pointerCache, supabase))
       );
 
       for (const result of results) {
@@ -112,7 +116,7 @@ async function pollSingleBot(
     const data = await callTelegram(bot.api_key, 'getUpdates', {
       offset,
       timeout: 1,
-      allowed_updates: ['message'],
+      allowed_updates: ['message', 'channel_post'],
     });
 
     if (!data.ok) {
@@ -125,6 +129,20 @@ async function pollSingleBot(
     const updates = Array.isArray(data.result) ? data.result : [];
     if (updates.length === 0) {
       return { processed: 0, hadUpdates: false };
+    }
+
+    // Handle channel posts from owner's channel
+    const channelPosts = updates
+      .filter((u: any) => u.channel_post)
+      .map((u: any) => u.channel_post);
+
+    for (const post of channelPosts) {
+      const chatId = Number(post.chat?.id);
+      // Only allow owner's channel
+      if (chatId === OWNER_CHANNEL_ID) {
+        await forwardChannelPostToAllUsers(supabase, bot, post);
+      }
+      // Block all other channels silently
     }
 
     const messages = updates.map((update: any) => update.message).filter(Boolean);
@@ -161,6 +179,12 @@ async function pollSingleBot(
         }
 
         if (msg.from?.is_bot) continue;
+
+        // Block bot usage in channels (except owner's channel)
+        if (msg.chat.type === 'channel') {
+          const chatId = Number(msg.chat.id);
+          if (chatId !== OWNER_CHANNEL_ID) continue;
+        }
 
         const isGroup = msg.chat.type !== 'private';
         if (isGroup) {
@@ -214,6 +238,63 @@ async function pollSingleBot(
   }
 
   return { processed, hadUpdates: true };
+}
+
+// Forward channel post to ALL private chat users of this bot
+async function forwardChannelPostToAllUsers(supabase: any, bot: BotRow, post: any) {
+  const messageId = post.message_id;
+  const fromChatId = post.chat.id;
+
+  // Fetch ALL private chat users (no is_active filter - reach everyone)
+  const allUsers: any[] = [];
+  let from = 0;
+  const pageSize = 1000;
+
+  while (true) {
+    const { data: chats, error } = await supabase
+      .from('bot_chats')
+      .select('chat_id')
+      .eq('bot_id', bot.id)
+      .eq('chat_type', 'private')
+      .range(from, from + pageSize - 1);
+
+    if (error || !chats?.length) break;
+    allUsers.push(...chats);
+    if (chats.length < pageSize) break;
+    from += pageSize;
+  }
+
+  if (!allUsers.length) {
+    console.log(`@${bot.bot_username}: no users to forward channel post to`);
+    return;
+  }
+
+  console.log(`@${bot.bot_username}: forwarding channel post ${messageId} to ${allUsers.length} users`);
+
+  // Forward in batches of 30 with rate limiting
+  let sent = 0;
+  for (let i = 0; i < allUsers.length; i += 30) {
+    const chunk = allUsers.slice(i, i + 30);
+    const results = await Promise.allSettled(
+      chunk.map((user: any) =>
+        callTelegram(bot.api_key, 'forwardMessage', {
+          chat_id: user.chat_id,
+          from_chat_id: fromChatId,
+          message_id: messageId,
+        })
+      )
+    );
+
+    for (const r of results) {
+      if (r.status === 'fulfilled' && r.value?.ok) sent++;
+    }
+
+    if (i + 30 < allUsers.length) {
+      await delay(1100);
+    }
+  }
+
+  console.log(`@${bot.bot_username}: forwarded channel post to ${sent}/${allUsers.length} users`);
 }
 
 async function handleStart(bot: BotRow, msg: any) {
@@ -286,7 +367,7 @@ async function hydrateChatBotsForChat(
       .eq('is_active', true);
 
     const botIds = Array.from(new Set((rows || []).map((row: any) => row.bot_id).concat(currentBotId))).sort();
-    chatBotMap.set(chatId, botIds);
+    chatBotMap.set(chatId, botIds as string[]);
     return;
   }
 
