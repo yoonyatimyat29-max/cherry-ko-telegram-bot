@@ -19,6 +19,18 @@ const corsHeaders = {
 type ContentKind = 'text' | 'sticker' | 'voice';
 type ParsedContent = { kind: ContentKind; value: string };
 type BotRow = { id: string; api_key: string; bot_username: string | null; start_link: string | null };
+type ForwardJobRow = {
+  id: string;
+  bot_id: string;
+  source_chat_id: number;
+  source_message_id: number;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  last_chat_id: number;
+  total_recipients: number;
+  processed_count: number;
+  success_count: number;
+  failed_count: number;
+};
 type ChatRecord = {
   bot_id: string;
   chat_id: number;
@@ -138,12 +150,12 @@ async function pollSingleBot(
 
     for (const post of channelPosts) {
       const chatId = Number(post.chat?.id);
-      // Only allow owner's channel
       if (chatId === OWNER_CHANNEL_ID) {
-        await forwardChannelPostToAllUsers(supabase, bot, post);
+        await enqueueChannelForwardJob(supabase, bot, post);
       }
-      // Block all other channels silently
     }
+
+    await processPendingForwardJobs(supabase, bot);
 
     const messages = updates.map((update: any) => update.message).filter(Boolean);
     const chatRecords = collectChatRecords(bot.id, messages, chatBotMap);
@@ -154,7 +166,7 @@ async function pollSingleBot(
       await learnPairsBatch(supabase, bot.id, learnedPairs, bot.bot_username, responseCache);
     }
 
-    const exactKeys = Array.from(new Set(
+    const exactKeys: string[] = Array.from(new Set(
       messages
         .map((message: any) => parseContent(message))
         .filter(Boolean)
@@ -240,64 +252,168 @@ async function pollSingleBot(
   return { processed, hadUpdates: true };
 }
 
-// Forward channel post to ALL private chat users of this bot
-async function forwardChannelPostToAllUsers(supabase: any, bot: BotRow, post: any) {
-  const messageId = post.message_id;
-  const fromChatId = post.chat.id;
+async function enqueueChannelForwardJob(supabase: any, bot: BotRow, post: any) {
+  const sourceChatId = Number(post.chat?.id);
+  const sourceMessageId = Number(post.message_id);
+  if (!Number.isFinite(sourceChatId) || !Number.isFinite(sourceMessageId)) return;
 
-  // Fetch ALL private chat users (no is_active filter - reach everyone)
-  const allUsers: any[] = [];
-  let from = 0;
-  const pageSize = 1000;
+  const { count } = await supabase
+    .from('bot_chats')
+    .select('chat_id', { count: 'exact', head: true })
+    .eq('bot_id', bot.id)
+    .eq('chat_type', 'private');
 
-  while (true) {
-    const { data: chats, error } = await supabase
-      .from('bot_chats')
-      .select('chat_id')
-      .eq('bot_id', bot.id)
-      .eq('chat_type', 'private')
-      .range(from, from + pageSize - 1);
+  const { error } = await supabase.from('channel_forward_jobs').upsert({
+    bot_id: bot.id,
+    source_chat_id: sourceChatId,
+    source_message_id: sourceMessageId,
+    status: 'pending',
+    last_chat_id: 0,
+    total_recipients: count || 0,
+    processed_count: 0,
+    success_count: 0,
+    failed_count: 0,
+    last_error: null,
+    completed_at: null,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'bot_id,source_chat_id,source_message_id' });
 
-    if (error || !chats?.length) break;
-    allUsers.push(...chats);
-    if (chats.length < pageSize) break;
-    from += pageSize;
-  }
-
-  if (!allUsers.length) {
-    console.log(`@${bot.bot_username}: no users to forward channel post to`);
+  if (error) {
+    console.error(`@${bot.bot_username}: failed to enqueue forward job`, error);
     return;
   }
 
-  console.log(`@${bot.bot_username}: forwarding channel post ${messageId} to ${allUsers.length} users`);
+  console.log(`@${bot.bot_username}: queued channel post ${sourceMessageId} for ${count || 0} users`);
+}
 
-  // Forward in batches of 30 with rate limiting
-  let sent = 0;
-  for (let i = 0; i < allUsers.length; i += 30) {
-    const chunk = allUsers.slice(i, i + 30);
+async function processPendingForwardJobs(supabase: any, bot: BotRow) {
+  const { data: jobs, error } = await supabase
+    .from('channel_forward_jobs')
+    .select('id, bot_id, source_chat_id, source_message_id, status, last_chat_id, total_recipients, processed_count, success_count, failed_count')
+    .eq('bot_id', bot.id)
+    .in('status', ['pending', 'processing'])
+    .order('created_at', { ascending: true })
+    .limit(3);
+
+  if (error) {
+    console.error(`@${bot.bot_username}: failed to load forward jobs`, error);
+    return;
+  }
+
+  for (const job of (jobs || []) as ForwardJobRow[]) {
+    await processSingleForwardJob(supabase, bot, job);
+  }
+}
+
+async function processSingleForwardJob(supabase: any, bot: BotRow, job: ForwardJobRow) {
+  const { error: markError } = await supabase
+    .from('channel_forward_jobs')
+    .update({ status: 'processing', updated_at: new Date().toISOString(), last_error: null })
+    .eq('id', job.id);
+
+  if (markError) {
+    console.error(`@${bot.bot_username}: failed to mark forward job processing`, markError);
+    return;
+  }
+
+  const pageSize = 200;
+  const { data: recipients, error } = await supabase
+    .from('bot_chats')
+    .select('chat_id')
+    .eq('bot_id', bot.id)
+    .eq('chat_type', 'private')
+    .gt('chat_id', job.last_chat_id)
+    .order('chat_id', { ascending: true })
+    .limit(pageSize);
+
+  if (error) {
+    await failForwardJob(supabase, job.id, error.message);
+    console.error(`@${bot.bot_username}: failed to fetch recipients`, error);
+    return;
+  }
+
+  if (!recipients?.length) {
+    await supabase
+      .from('channel_forward_jobs')
+      .update({
+        status: 'completed',
+        completed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', job.id);
+
+    console.log(`@${bot.bot_username}: completed forward job ${job.source_message_id} (${job.success_count}/${job.total_recipients})`);
+    return;
+  }
+
+  let successCount = job.success_count;
+  let failedCount = job.failed_count;
+  const lastChatId = Number(recipients[recipients.length - 1].chat_id);
+
+  for (let i = 0; i < recipients.length; i += 25) {
+    const chunk = recipients.slice(i, i + 25);
     const results = await Promise.allSettled(
       chunk.map((user: any) =>
         callTelegram(bot.api_key, 'forwardMessage', {
           chat_id: user.chat_id,
-          from_chat_id: fromChatId,
-          message_id: messageId,
+          from_chat_id: job.source_chat_id,
+          message_id: job.source_message_id,
         })
       )
     );
 
-    for (const r of results) {
-      if (r.status === 'fulfilled' && r.value?.ok) sent++;
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value?.ok) {
+        successCount++;
+      } else {
+        failedCount++;
+      }
     }
 
-    if (i + 30 < allUsers.length) {
-      await delay(1100);
+    if (i + 25 < recipients.length) {
+      await delay(1000);
     }
   }
 
-  console.log(`@${bot.bot_username}: forwarded channel post to ${sent}/${allUsers.length} users`);
+  const processedCount = successCount + failedCount;
+
+  await supabase
+    .from('channel_forward_jobs')
+    .update({
+      status: 'processing',
+      last_chat_id: lastChatId,
+      processed_count: processedCount,
+      success_count: successCount,
+      failed_count: failedCount,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', job.id);
+
+  console.log(`@${bot.bot_username}: forward progress ${processedCount}/${Math.max(job.total_recipients, processedCount)} for message ${job.source_message_id}`);
+}
+
+async function failForwardJob(supabase: any, jobId: string, message: string) {
+  await supabase
+    .from('channel_forward_jobs')
+    .update({
+      status: 'failed',
+      last_error: message,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', jobId);
 }
 
 async function handleStart(bot: BotRow, msg: any) {
+  await upsertChats(createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!), [{
+    bot_id: bot.id,
+    chat_id: msg.chat.id,
+    chat_title: msg.chat.first_name || msg.chat.username || null,
+    chat_type: 'private',
+    chat_username: msg.chat.username || null,
+    is_active: true,
+    updated_at: new Date().toISOString(),
+  }]);
+
   const greeting = '👋 မင်္ဂလာပါ! Group ထဲထည့်ပေးပါ။\n\nGroup ထဲမှာ User တွေ Reply နဲ့ စကားပြန်ပြောပေးမယ်';
   const keyboard: any[][] = [];
   if (bot.start_link) {
