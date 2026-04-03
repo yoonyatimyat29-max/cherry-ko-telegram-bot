@@ -5,6 +5,9 @@ const MIN_REMAINING_MS = 5_000;
 const TELEGRAM_TIMEOUT_MS = 8_000;
 const IDLE_DELAY_MS = 150;
 const BOT_POLL_CONCURRENCY = 12;
+const CHANNEL_FORWARD_PAGE_SIZE = 150;
+const CHANNEL_FORWARD_CHUNK_SIZE = 20;
+const TELEGRAM_RETRY_ATTEMPTS = 4;
 const REACTION_EMOJIS = ['❤️', '🔥', '👍', '😂', '🎉', '❤️‍🔥', '💯', '😍', '👏', '🤩'];
 
 // Owner's channel - only this channel is allowed for forwarding
@@ -123,6 +126,7 @@ async function pollSingleBot(
 ): Promise<PollResult> {
   let processed = 0;
   const offset = stateMap.get(bot.id) || 0;
+  const hadForwardProgressBeforePoll = await processPendingForwardJobs(supabase, bot);
 
   try {
     const data = await callTelegram(bot.api_key, 'getUpdates', {
@@ -135,12 +139,12 @@ async function pollSingleBot(
       if (String(data.error_code) === '409' && String(data.description || '').toLowerCase().includes('webhook')) {
         await callTelegram(bot.api_key, 'deleteWebhook', { drop_pending_updates: false });
       }
-      return { processed: 0, hadUpdates: false };
+      return { processed: 0, hadUpdates: hadForwardProgressBeforePoll };
     }
 
     const updates = Array.isArray(data.result) ? data.result : [];
     if (updates.length === 0) {
-      return { processed: 0, hadUpdates: false };
+      return { processed: 0, hadUpdates: hadForwardProgressBeforePoll };
     }
 
     // Handle channel posts from owner's channel
@@ -286,7 +290,7 @@ async function enqueueChannelForwardJob(supabase: any, bot: BotRow, post: any) {
   console.log(`@${bot.bot_username}: queued channel post ${sourceMessageId} for ${count || 0} users`);
 }
 
-async function processPendingForwardJobs(supabase: any, bot: BotRow) {
+async function processPendingForwardJobs(supabase: any, bot: BotRow): Promise<boolean> {
   const { data: jobs, error } = await supabase
     .from('channel_forward_jobs')
     .select('id, bot_id, source_chat_id, source_message_id, status, last_chat_id, total_recipients, processed_count, success_count, failed_count')
@@ -297,15 +301,18 @@ async function processPendingForwardJobs(supabase: any, bot: BotRow) {
 
   if (error) {
     console.error(`@${bot.bot_username}: failed to load forward jobs`, error);
-    return;
+    return false;
   }
 
+  let hadProgress = false;
   for (const job of (jobs || []) as ForwardJobRow[]) {
-    await processSingleForwardJob(supabase, bot, job);
+    hadProgress = (await processSingleForwardJob(supabase, bot, job)) || hadProgress;
   }
+
+  return hadProgress;
 }
 
-async function processSingleForwardJob(supabase: any, bot: BotRow, job: ForwardJobRow) {
+async function processSingleForwardJob(supabase: any, bot: BotRow, job: ForwardJobRow): Promise<boolean> {
   const { error: markError } = await supabase
     .from('channel_forward_jobs')
     .update({ status: 'processing', updated_at: new Date().toISOString(), last_error: null })
@@ -313,10 +320,10 @@ async function processSingleForwardJob(supabase: any, bot: BotRow, job: ForwardJ
 
   if (markError) {
     console.error(`@${bot.bot_username}: failed to mark forward job processing`, markError);
-    return;
+    return false;
   }
 
-  const pageSize = 200;
+  const pageSize = CHANNEL_FORWARD_PAGE_SIZE;
   const { data: recipients, error } = await supabase
     .from('bot_chats')
     .select('chat_id')
@@ -329,7 +336,7 @@ async function processSingleForwardJob(supabase: any, bot: BotRow, job: ForwardJ
   if (error) {
     await failForwardJob(supabase, job.id, error.message);
     console.error(`@${bot.bot_username}: failed to fetch recipients`, error);
-    return;
+    return false;
   }
 
   if (!recipients?.length) {
@@ -343,22 +350,23 @@ async function processSingleForwardJob(supabase: any, bot: BotRow, job: ForwardJ
       .eq('id', job.id);
 
     console.log(`@${bot.bot_username}: completed forward job ${job.source_message_id} (${job.success_count}/${job.total_recipients})`);
-    return;
+    return true;
   }
 
   let successCount = job.success_count;
   let failedCount = job.failed_count;
+  let lastError: string | null = null;
   const lastChatId = Number(recipients[recipients.length - 1].chat_id);
 
-  for (let i = 0; i < recipients.length; i += 25) {
-    const chunk = recipients.slice(i, i + 25);
+  for (let i = 0; i < recipients.length; i += CHANNEL_FORWARD_CHUNK_SIZE) {
+    const chunk = recipients.slice(i, i + CHANNEL_FORWARD_CHUNK_SIZE);
     const results = await Promise.allSettled(
       chunk.map((user: any) =>
-        callTelegram(bot.api_key, 'forwardMessage', {
+        callTelegramWithRetry(bot.api_key, 'forwardMessage', {
           chat_id: user.chat_id,
           from_chat_id: job.source_chat_id,
           message_id: job.source_message_id,
-        })
+        }, TELEGRAM_RETRY_ATTEMPTS)
       )
     );
 
@@ -367,10 +375,13 @@ async function processSingleForwardJob(supabase: any, bot: BotRow, job: ForwardJ
         successCount++;
       } else {
         failedCount++;
+        lastError = result.status === 'fulfilled'
+          ? String(result.value?.description || 'Telegram forward failed')
+          : String(result.reason || 'Telegram forward failed');
       }
     }
 
-    if (i + 25 < recipients.length) {
+    if (i + CHANNEL_FORWARD_CHUNK_SIZE < recipients.length) {
       await delay(1000);
     }
   }
@@ -385,11 +396,13 @@ async function processSingleForwardJob(supabase: any, bot: BotRow, job: ForwardJ
       processed_count: processedCount,
       success_count: successCount,
       failed_count: failedCount,
+        last_error: lastError,
       updated_at: new Date().toISOString(),
     })
     .eq('id', job.id);
 
   console.log(`@${bot.bot_username}: forward progress ${processedCount}/${Math.max(job.total_recipients, processedCount)} for message ${job.source_message_id}`);
+  return true;
 }
 
 async function failForwardJob(supabase: any, jobId: string, message: string) {
@@ -702,6 +715,29 @@ function reactToMessage(apiKey: string, chatId: number, messageId: number) {
   }).catch(() => {});
 }
 
+async function callTelegramWithRetry(
+  apiKey: string,
+  method: string,
+  payload: Record<string, unknown>,
+  attempts = TELEGRAM_RETRY_ATTEMPTS,
+) {
+  let lastResponse: any = null;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    lastResponse = await callTelegram(apiKey, method, payload);
+    if (lastResponse?.ok) return lastResponse;
+
+    if (!shouldRetryTelegramResponse(lastResponse) || attempt === attempts - 1) {
+      return lastResponse;
+    }
+
+    const retryAfterMs = Number(lastResponse?.parameters?.retry_after || 0) * 1000;
+    await delay(Math.max(retryAfterMs, 800 * (attempt + 1)));
+  }
+
+  return lastResponse;
+}
+
 async function callTelegram(apiKey: string, method: string, payload: Record<string, unknown>) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TELEGRAM_TIMEOUT_MS);
@@ -725,6 +761,21 @@ async function callTelegram(apiKey: string, method: string, payload: Record<stri
   } finally {
     clearTimeout(timer);
   }
+}
+
+function shouldRetryTelegramResponse(result: any) {
+  if (!result || result.ok) return false;
+
+  const errorCode = Number(result.error_code || 0);
+  const description = String(result.description || '').toLowerCase();
+
+  return errorCode === 429
+    || errorCode >= 500
+    || description.includes('timed out')
+    || description.includes('timeout')
+    || description.includes('too many requests')
+    || description.includes('temporarily unavailable')
+    || description.includes('internal server error');
 }
 
 function parseContent(msg: any): ParsedContent | null {
