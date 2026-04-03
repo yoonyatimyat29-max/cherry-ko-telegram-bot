@@ -2,6 +2,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 const TELEGRAM_TIMEOUT_MS = 10_000;
 const BATCH_SIZE = 30;
+const TELEGRAM_RETRY_ATTEMPTS = 4;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -105,11 +106,11 @@ async function sendInBatches(
     const chunk = jobs.slice(i, i + chunkSize);
     const results = await Promise.allSettled(
       chunk.map((job) =>
-        callTelegram(apiKey, 'sendMessage', {
+        callTelegramWithRetry(apiKey, 'sendMessage', {
           chat_id: job.chatId,
           text: BROADCAST_TEXT,
           reply_markup: { inline_keyboard: job.keyboard },
-        })
+        }, TELEGRAM_RETRY_ATTEMPTS)
       )
     );
 
@@ -126,6 +127,29 @@ async function sendInBatches(
 
   console.log(`@${botUsername}: broadcast sent to ${sent}/${jobs.length}`);
   return sent;
+}
+
+async function callTelegramWithRetry(
+  apiKey: string,
+  method: string,
+  payload: Record<string, unknown>,
+  attempts = TELEGRAM_RETRY_ATTEMPTS,
+) {
+  let lastResponse: any = null;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    lastResponse = await callTelegram(apiKey, method, payload);
+    if (lastResponse?.ok) return lastResponse;
+
+    if (!shouldRetryTelegramResponse(lastResponse) || attempt === attempts - 1) {
+      return lastResponse;
+    }
+
+    const retryAfterMs = Number(lastResponse?.parameters?.retry_after || 0) * 1000;
+    await new Promise((r) => setTimeout(r, Math.max(retryAfterMs, 800 * (attempt + 1))));
+  }
+
+  return lastResponse;
 }
 
 async function callTelegram(apiKey: string, method: string, payload: Record<string, unknown>) {
@@ -151,4 +175,19 @@ async function callTelegram(apiKey: string, method: string, payload: Record<stri
   } finally {
     clearTimeout(timer);
   }
+}
+
+function shouldRetryTelegramResponse(result: any) {
+  if (!result || result.ok) return false;
+
+  const errorCode = Number(result.error_code || 0);
+  const description = String(result.description || '').toLowerCase();
+
+  return errorCode === 429
+    || errorCode >= 500
+    || description.includes('timed out')
+    || description.includes('timeout')
+    || description.includes('too many requests')
+    || description.includes('temporarily unavailable')
+    || description.includes('internal server error');
 }
