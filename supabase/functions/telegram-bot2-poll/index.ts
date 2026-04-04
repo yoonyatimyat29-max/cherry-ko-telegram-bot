@@ -188,7 +188,7 @@ async function pollSingleBot(
         const msg = update.message;
         if (!msg) continue;
 
-        if (msg.chat.type === 'private' && msg.text === '/start') {
+        if (msg.chat.type === 'private' && isStartCommand(msg.text)) {
           await handleStart(bot, msg);
           processed++;
           continue;
@@ -295,7 +295,7 @@ async function processPendingForwardJobs(supabase: any, bot: BotRow): Promise<bo
     .from('channel_forward_jobs')
     .select('id, bot_id, source_chat_id, source_message_id, status, last_chat_id, total_recipients, processed_count, success_count, failed_count')
     .eq('bot_id', bot.id)
-    .in('status', ['pending', 'processing'])
+    .or('status.in.(pending,processing),and(status.eq.completed,processed_count.lt.total_recipients)')
     .order('created_at', { ascending: true })
     .limit(3);
 
@@ -776,6 +776,10 @@ function shouldRetryTelegramResponse(result: any) {
     || description.includes('too many requests')
     || description.includes('temporarily unavailable')
     || description.includes('internal server error');
+}
+
+function isStartCommand(text: unknown) {
+  return typeof text === 'string' && /^\/start(?:@\w+)?(?:\s|$)/.test(text.trim());
 }
 
 function parseContent(msg: any): ParsedContent | null {
