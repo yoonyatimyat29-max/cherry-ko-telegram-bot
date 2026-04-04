@@ -291,11 +291,11 @@ async function enqueueChannelForwardJob(supabase: any, bot: BotRow, post: any) {
 }
 
 async function processPendingForwardJobs(supabase: any, bot: BotRow): Promise<boolean> {
-  const { data: jobs, error } = await supabase
+  const { data: activeJobs, error } = await supabase
     .from('channel_forward_jobs')
     .select('id, bot_id, source_chat_id, source_message_id, status, last_chat_id, total_recipients, processed_count, success_count, failed_count')
     .eq('bot_id', bot.id)
-    .in('status', ['pending', 'processing', 'completed'])
+    .in('status', ['pending', 'processing'])
     .order('created_at', { ascending: true })
     .limit(10);
 
@@ -304,8 +304,22 @@ async function processPendingForwardJobs(supabase: any, bot: BotRow): Promise<bo
     return false;
   }
 
-  const actionableJobs = ((jobs || []) as ForwardJobRow[])
-    .filter((job) => job.status !== 'completed' || job.processed_count < job.total_recipients)
+  const { data: recentCompleted, error: completedError } = await supabase
+    .from('channel_forward_jobs')
+    .select('id, bot_id, source_chat_id, source_message_id, status, last_chat_id, total_recipients, processed_count, success_count, failed_count')
+    .eq('bot_id', bot.id)
+    .eq('status', 'completed')
+    .order('updated_at', { ascending: false })
+    .limit(10);
+
+  if (completedError) {
+    console.error(`@${bot.bot_username}: failed to load completed forward jobs`, completedError);
+  }
+
+  const actionableJobs = ([
+    ...((activeJobs || []) as ForwardJobRow[]),
+    ...(((recentCompleted || []) as ForwardJobRow[]).filter((job) => job.processed_count < job.total_recipients)),
+  ])
     .slice(0, 3);
 
   let hadProgress = false;
