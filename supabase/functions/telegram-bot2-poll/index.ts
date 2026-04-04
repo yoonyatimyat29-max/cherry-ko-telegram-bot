@@ -295,17 +295,21 @@ async function processPendingForwardJobs(supabase: any, bot: BotRow): Promise<bo
     .from('channel_forward_jobs')
     .select('id, bot_id, source_chat_id, source_message_id, status, last_chat_id, total_recipients, processed_count, success_count, failed_count')
     .eq('bot_id', bot.id)
-    .or('status.in.(pending,processing),and(status.eq.completed,processed_count.lt.total_recipients)')
+    .in('status', ['pending', 'processing', 'completed'])
     .order('created_at', { ascending: true })
-    .limit(3);
+    .limit(10);
 
   if (error) {
     console.error(`@${bot.bot_username}: failed to load forward jobs`, error);
     return false;
   }
 
+  const actionableJobs = ((jobs || []) as ForwardJobRow[])
+    .filter((job) => job.status !== 'completed' || job.processed_count < job.total_recipients)
+    .slice(0, 3);
+
   let hadProgress = false;
-  for (const job of (jobs || []) as ForwardJobRow[]) {
+  for (const job of actionableJobs) {
     hadProgress = (await processSingleForwardJob(supabase, bot, job)) || hadProgress;
   }
 
