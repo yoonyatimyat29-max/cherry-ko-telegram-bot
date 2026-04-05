@@ -435,7 +435,8 @@ async function failForwardJob(supabase: any, jobId: string, message: string) {
 }
 
 async function handleStart(bot: BotRow, msg: any) {
-  await upsertChats(createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!), [{
+  const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+  await upsertChats(supabase, [{
     bot_id: bot.id,
     chat_id: msg.chat.id,
     chat_title: msg.chat.first_name || msg.chat.username || null,
