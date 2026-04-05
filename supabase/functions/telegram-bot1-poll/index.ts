@@ -126,7 +126,7 @@ Deno.serve(async (req) => {
             const botId = cbData.replace('manage_bot:', '');
             const { data: bot } = await supabase
               .from('bots')
-              .select('id, bot_username, bot_name, owner_chat_id, is_active, start_link')
+              .select('id, bot_username, bot_name, owner_chat_id, is_active')
               .eq('id', botId)
               .single();
 
@@ -135,15 +135,27 @@ Deno.serve(async (req) => {
             } else {
               const name = bot.bot_username || bot.bot_name || 'Unknown';
               const status = bot.is_active ? '🟢 Active' : '🔴 Inactive';
-              const linkInfo = bot.start_link ? `\n🔗 Link: ${bot.start_link}` : '\n🔗 Link: မထည့်ရသေးပါ';
+
+              // Fetch bot_links
+              const { data: links } = await supabase
+                .from('bot_links')
+                .select('id, link_title, link_url')
+                .eq('bot_id', botId)
+                .order('created_at', { ascending: true });
+
+              let linkInfo = '';
+              if (links && links.length > 0) {
+                linkInfo = '\n\n🔗 Links:\n' + links.map((l: any, i: number) => `${i + 1}. ${l.link_title} - ${l.link_url}`).join('\n');
+              } else {
+                linkInfo = '\n\n🔗 Link: မထည့်ရသေးပါ';
+              }
 
               const keyboard: any[][] = [];
 
-              if (bot.start_link) {
-                keyboard.push([{ text: '🔗 Link ပြောင်းရန်', callback_data: `set_link:${bot.id}` }]);
-                keyboard.push([{ text: '❌ Link ဖျက်ရန်', callback_data: `remove_link:${bot.id}` }]);
-              } else {
-                keyboard.push([{ text: '🔗 Channel/Group Link ထည့်ရန်', callback_data: `set_link:${bot.id}` }]);
+              keyboard.push([{ text: '➕ Link ထည့်ရန်', callback_data: `add_link:${bot.id}` }]);
+
+              if (links && links.length > 0) {
+                keyboard.push([{ text: '🗑 Link ဖျက်ရန်', callback_data: `list_remove_links:${bot.id}` }]);
               }
 
               if (bot.is_active) {
@@ -161,8 +173,8 @@ Deno.serve(async (req) => {
               }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
             }
 
-          } else if (cbData.startsWith('set_link:')) {
-            const botId = cbData.replace('set_link:', '');
+          } else if (cbData.startsWith('add_link:')) {
+            const botId = cbData.replace('add_link:', '');
             const { data: bot } = await supabase
               .from('bots')
               .select('id, owner_chat_id, bot_username')
@@ -174,33 +186,60 @@ Deno.serve(async (req) => {
             } else {
               await supabase
                 .from('bot1_conversations')
-                .upsert({ chat_id: cbChatId, state: `waiting_link:${botId}`, updated_at: new Date().toISOString() }, { onConflict: 'chat_id' });
+                .upsert({ chat_id: cbChatId, state: `waiting_link_title:${botId}`, updated_at: new Date().toISOString() }, { onConflict: 'chat_id' });
 
               await callGateway('sendMessage', {
                 chat_id: cbChatId,
-                text: `🔗 @${bot.bot_username} အတွက် Channel သို့မဟုတ် Group Link ကို ပို့ပေးပါ။\n\nဥပမာ: https://t.me/your_channel`,
+                text: `🔗 @${bot.bot_username} အတွက် Button Title ကို ရိုက်ထည့်ပါ။\n\nဥပမာ: Official Group`,
               }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
             }
 
-          } else if (cbData.startsWith('remove_link:')) {
-            const botId = cbData.replace('remove_link:', '');
+          } else if (cbData.startsWith('list_remove_links:')) {
+            const botId = cbData.replace('list_remove_links:', '');
             const { data: bot } = await supabase
               .from('bots')
-              .select('id, owner_chat_id, bot_username')
+              .select('id, owner_chat_id')
               .eq('id', botId)
               .single();
 
             if (!bot || String(bot.owner_chat_id) !== String(cbChatId)) {
               await callGateway('sendMessage', { chat_id: cbChatId, text: '❌ ခွင့်မရှိပါ။' }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
             } else {
-              await supabase.from('bots').update({ start_link: null }).eq('id', botId);
-              await callGateway('sendMessage', {
-                chat_id: cbChatId,
-                text: `✅ @${bot.bot_username} ရဲ့ Link ကို ဖျက်ပြီးပါပြီ။`,
-                reply_markup: { inline_keyboard: [[{ text: '🔙 Bot စီမံရန်', callback_data: `manage_bot:${botId}` }]] },
-              }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+              const { data: links } = await supabase
+                .from('bot_links')
+                .select('id, link_title, link_url')
+                .eq('bot_id', botId)
+                .order('created_at', { ascending: true });
+
+              if (!links || links.length === 0) {
+                await callGateway('sendMessage', {
+                  chat_id: cbChatId,
+                  text: '📭 ဖျက်ရန် Link မရှိပါ။',
+                  reply_markup: { inline_keyboard: [[{ text: '🔙 Bot စီမံရန်', callback_data: `manage_bot:${botId}` }]] },
+                }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+              } else {
+                const keyboard = links.map((l: any) => [{ text: `❌ ${l.link_title}`, callback_data: `rm_link:${l.id}:${botId}` }]);
+                keyboard.push([{ text: '🔙 Bot စီမံရန်', callback_data: `manage_bot:${botId}` }]);
+
+                await callGateway('sendMessage', {
+                  chat_id: cbChatId,
+                  text: '🗑 ဖျက်ချင်တဲ့ Link ကို နှိပ်ပါ:',
+                  reply_markup: { inline_keyboard: keyboard },
+                }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+              }
             }
 
+          } else if (cbData.startsWith('rm_link:')) {
+            const parts = cbData.replace('rm_link:', '').split(':');
+            const linkId = parts[0];
+            const botId = parts[1];
+
+            await supabase.from('bot_links').delete().eq('id', linkId);
+            await callGateway('sendMessage', {
+              chat_id: cbChatId,
+              text: '✅ Link ဖျက်ပြီးပါပြီ။',
+              reply_markup: { inline_keyboard: [[{ text: '🔙 Bot စီမံရန်', callback_data: `manage_bot:${botId}` }]] },
+            }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
           } else if (cbData.startsWith('reactivate_bot:')) {
             const botId = cbData.replace('reactivate_bot:', '');
             const { data: bot } = await supabase
@@ -317,9 +356,43 @@ Deno.serve(async (req) => {
 
         if (!convo) { totalProcessed++; continue; }
 
-        // Handle link setting
-        if (convo.state.startsWith('waiting_link:')) {
-          const botId = convo.state.replace('waiting_link:', '');
+        // Handle link title input
+        if (convo.state.startsWith('waiting_link_title:')) {
+          const botId = convo.state.replace('waiting_link_title:', '');
+          const title = text;
+
+          if (!title || title.length > 64) {
+            await callGateway('sendMessage', {
+              chat_id: chatId,
+              text: '❌ Title ကို 1-64 characters အတွင်း ထည့်ပါ။',
+            }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            totalProcessed++;
+            continue;
+          }
+
+          // Encode title in state (base64-safe)
+          const encodedTitle = btoa(unescape(encodeURIComponent(title)));
+          await supabase
+            .from('bot1_conversations')
+            .update({ state: `waiting_link_url:${botId}:${encodedTitle}`, updated_at: new Date().toISOString() })
+            .eq('chat_id', chatId);
+
+          await callGateway('sendMessage', {
+            chat_id: chatId,
+            text: `✅ Title: "${title}"\n\n🔗 ယခု Link URL ကို ပို့ပေးပါ။\n\nဥပမာ: https://t.me/your_channel`,
+          }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+
+          totalProcessed++;
+          continue;
+        }
+
+        // Handle link URL input
+        if (convo.state.startsWith('waiting_link_url:')) {
+          const stateData = convo.state.replace('waiting_link_url:', '');
+          const colonIdx = stateData.indexOf(':');
+          const botId = stateData.substring(0, colonIdx);
+          const encodedTitle = stateData.substring(colonIdx + 1);
+          const linkTitle = decodeURIComponent(escape(atob(encodedTitle)));
           const link = text;
 
           if (!link.startsWith('https://') && !link.startsWith('http://') && !link.startsWith('t.me/')) {
@@ -342,13 +415,16 @@ Deno.serve(async (req) => {
           if (!bot || String(bot.owner_chat_id) !== String(chatId)) {
             await callGateway('sendMessage', { chat_id: chatId, text: '❌ ခွင့်မရှိပါ။' }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
           } else {
-            await supabase.from('bots').update({ start_link: finalLink }).eq('id', botId);
+            await supabase.from('bot_links').insert({ bot_id: botId, link_url: finalLink, link_title: linkTitle });
             await supabase.from('bot1_conversations').update({ state: 'idle', updated_at: new Date().toISOString() }).eq('chat_id', chatId);
 
             await callGateway('sendMessage', {
               chat_id: chatId,
-              text: `✅ @${bot.bot_username} ရဲ့ /start Link ကို သတ်မှတ်ပြီးပါပြီ!\n\n🔗 ${finalLink}`,
-              reply_markup: { inline_keyboard: [[{ text: '🔙 Bot စီမံရန်', callback_data: `manage_bot:${botId}` }]] },
+              text: `✅ Link ထည့်ပြီးပါပြီ!\n\n📌 ${linkTitle}\n🔗 ${finalLink}`,
+              reply_markup: { inline_keyboard: [
+                [{ text: '➕ နောက်ထပ် Link ထည့်ရန်', callback_data: `add_link:${botId}` }],
+                [{ text: '🔙 Bot စီမံရန်', callback_data: `manage_bot:${botId}` }],
+              ] },
             }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
           }
 

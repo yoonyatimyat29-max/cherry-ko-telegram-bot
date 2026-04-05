@@ -19,8 +19,8 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-type ContentKind = 'text' | 'sticker' | 'voice';
-type ParsedContent = { kind: ContentKind; value: string };
+type ContentKind = 'text' | 'sticker' | 'voice' | 'text_rich';
+type ParsedContent = { kind: ContentKind; value: string; entities?: any[] };
 type BotRow = { id: string; api_key: string; bot_username: string | null; start_link: string | null };
 type ForwardJobRow = {
   id: string;
@@ -435,7 +435,8 @@ async function failForwardJob(supabase: any, jobId: string, message: string) {
 }
 
 async function handleStart(bot: BotRow, msg: any) {
-  await upsertChats(createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!), [{
+  const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+  await upsertChats(supabase, [{
     bot_id: bot.id,
     chat_id: msg.chat.id,
     chat_title: msg.chat.first_name || msg.chat.username || null,
@@ -447,7 +448,19 @@ async function handleStart(bot: BotRow, msg: any) {
 
   const greeting = '👋 မင်္ဂလာပါ! Group ထဲထည့်ပေးပါ။\n\nGroup ထဲမှာ User တွေ Reply နဲ့ စကားပြန်ပြောပေးမယ်';
   const keyboard: any[][] = [];
-  if (bot.start_link) {
+
+  // Fetch bot_links from database
+  const { data: botLinks } = await supabase
+    .from('bot_links')
+    .select('link_title, link_url')
+    .eq('bot_id', bot.id)
+    .order('created_at', { ascending: true });
+
+  if (botLinks && botLinks.length > 0) {
+    for (const link of botLinks) {
+      keyboard.push([{ text: link.link_title, url: link.link_url }]);
+    }
+  } else if (bot.start_link) {
     keyboard.push([{ text: '📢 Join ပေးပါရန်', url: bot.start_link }]);
   }
   keyboard.push([{ text: '➕ Group ထဲ ထည့်ရန်', url: `https://t.me/${bot.bot_username}?startgroup=true` }]);
@@ -546,7 +559,7 @@ function collectLearnedPairs(messages: any[]): LearnedPair[] {
     if (!msg?.reply_to_message) continue;
 
     const triggerContent = parseContent(msg.reply_to_message);
-    const responseContent = parseContent(msg);
+    const responseContent = parseResponseContent(msg);
     if (!triggerContent || !responseContent) continue;
 
     const triggerKey = encodeContent(triggerContent);
@@ -696,12 +709,16 @@ async function tryRespond(
       allow_sending_without_reply: true,
     });
   } else {
-    await callTelegram(bot.api_key, 'sendMessage', {
+    const payload: Record<string, unknown> = {
       chat_id: msg.chat.id,
       text: selected.value,
       reply_to_message_id: msg.message_id,
       allow_sending_without_reply: true,
-    });
+    };
+    if (selected.entities && selected.entities.length > 0) {
+      payload.entities = selected.entities;
+    }
+    await callTelegram(bot.api_key, 'sendMessage', payload);
   }
 
   const nextPtr = (ptr + 1) % responses.length;
@@ -817,14 +834,48 @@ function parseContent(msg: any): ParsedContent | null {
 }
 
 function encodeContent(content: ParsedContent): string {
+  if (content.kind === 'text_rich' && content.entities && content.entities.length > 0) {
+    return `text_rich:${JSON.stringify({ text: content.value, entities: content.entities })}`;
+  }
   return `${content.kind}:${content.value}`;
 }
 
 function decodeContent(stored: string): ParsedContent {
+  if (stored.startsWith('text_rich:')) {
+    try {
+      const data = JSON.parse(stored.slice(9));
+      return { kind: 'text', value: data.text, entities: data.entities };
+    } catch {
+      return { kind: 'text', value: stored.slice(9) };
+    }
+  }
   if (stored.startsWith('text:')) return { kind: 'text', value: stored.slice(5) };
   if (stored.startsWith('sticker:')) return { kind: 'sticker', value: stored.slice(8) };
   if (stored.startsWith('voice:')) return { kind: 'voice', value: stored.slice(6) };
   return { kind: 'text', value: stored };
+}
+
+// Parse response content preserving original text case and custom emoji entities
+function parseResponseContent(msg: any): ParsedContent | null {
+  if (typeof msg?.text === 'string' && msg.text.trim().length > 0) {
+    const text = msg.text.trim();
+    // Check for custom_emoji entities (premium emoji)
+    const customEmojiEntities = (msg.entities || []).filter((e: any) => e.type === 'custom_emoji');
+    if (customEmojiEntities.length > 0) {
+      return { kind: 'text_rich', value: text, entities: customEmojiEntities };
+    }
+    return { kind: 'text', value: text.replace(/\s+/g, ' ').toLocaleLowerCase() };
+  }
+  if (msg?.sticker?.file_id) {
+    return { kind: 'sticker', value: msg.sticker.file_id };
+  }
+  if (msg?.voice?.file_id) {
+    return { kind: 'voice', value: msg.voice.file_id };
+  }
+  if (msg?.audio?.file_id) {
+    return { kind: 'voice', value: msg.audio.file_id };
+  }
+  return null;
 }
 
 function pointerCacheKey(botId: string, triggerKey: string) {

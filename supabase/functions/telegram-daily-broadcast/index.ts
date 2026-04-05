@@ -35,8 +35,26 @@ Deno.serve(async (req) => {
     });
   }
 
+  // Fetch all bot_links at once
+  const botIds = bots.map((b: any) => b.id);
+  const { data: allBotLinks } = await supabase
+    .from('bot_links')
+    .select('bot_id, link_title, link_url')
+    .in('bot_id', botIds)
+    .order('created_at', { ascending: true });
+
+  // Group links by bot_id
+  const linksByBot = new Map<string, any[]>();
+  if (allBotLinks) {
+    for (const link of allBotLinks) {
+      const existing = linksByBot.get(link.bot_id) || [];
+      existing.push(link);
+      linksByBot.set(link.bot_id, existing);
+    }
+  }
+
   const totals = await Promise.allSettled(
-    bots.map((bot: any) => processBotBroadcast(supabase, bot))
+    bots.map((bot: any) => processBotBroadcast(supabase, bot, linksByBot.get(bot.id) || []))
   );
 
   const sent = totals.reduce((sum, result) => {
@@ -49,7 +67,7 @@ Deno.serve(async (req) => {
   });
 });
 
-async function processBotBroadcast(supabase: any, bot: any): Promise<number> {
+async function processBotBroadcast(supabase: any, bot: any, botLinks: any[]): Promise<number> {
   // Fetch ALL chats (including inactive) to reach every user who ever started the bot
   const allChats: any[] = [];
   let from = 0;
@@ -75,20 +93,24 @@ async function processBotBroadcast(supabase: any, bot: any): Promise<number> {
 
   console.log(`@${bot.bot_username}: ${groupChats.length} groups, ${privateChats.length} private chats`);
 
+  // Build bot-specific link buttons
+  const botLinkButtons = botLinks.map((l: any) => [{ text: l.link_title, url: l.link_url }]);
+  const baseButtons = [...FIXED_BUTTONS, ...botLinkButtons];
+
   const sendJobs: Array<{ chatId: number; keyboard: any[][] }> = [];
 
-  // Group chats: fixed buttons + current group's own link only
+  // Group chats: base buttons + current group's own link only
   for (const chat of groupChats) {
-    const keyboard = [...FIXED_BUTTONS];
+    const keyboard = [...baseButtons];
     if (chat.chat_username) {
       keyboard.push([{ text: `💬 ${chat.chat_title || chat.chat_username}`, url: `https://t.me/${chat.chat_username}` }]);
     }
     sendJobs.push({ chatId: chat.chat_id, keyboard });
   }
 
-  // Private chats: fixed buttons only (no group links)
+  // Private chats: base buttons only (no group links)
   for (const chat of privateChats) {
-    sendJobs.push({ chatId: chat.chat_id, keyboard: [...FIXED_BUTTONS] });
+    sendJobs.push({ chatId: chat.chat_id, keyboard: [...baseButtons] });
   }
 
   return sendInBatches(bot.api_key, bot.bot_username, sendJobs, BATCH_SIZE);

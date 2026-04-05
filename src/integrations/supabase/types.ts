@@ -58,6 +58,38 @@ export type Database = {
           },
         ]
       }
+      bot_links: {
+        Row: {
+          bot_id: string
+          created_at: string
+          id: string
+          link_title: string
+          link_url: string
+        }
+        Insert: {
+          bot_id: string
+          created_at?: string
+          id?: string
+          link_title: string
+          link_url: string
+        }
+        Update: {
+          bot_id?: string
+          created_at?: string
+          id?: string
+          link_title?: string
+          link_url?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "bot_links_bot_id_fkey"
+            columns: ["bot_id"]
+            isOneToOne: false
+            referencedRelation: "bots"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       bot1_conversations: {
         Row: {
           chat_id: number
