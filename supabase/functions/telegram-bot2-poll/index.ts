@@ -834,14 +834,48 @@ function parseContent(msg: any): ParsedContent | null {
 }
 
 function encodeContent(content: ParsedContent): string {
+  if (content.kind === 'text_rich' && content.entities && content.entities.length > 0) {
+    return `text_rich:${JSON.stringify({ text: content.value, entities: content.entities })}`;
+  }
   return `${content.kind}:${content.value}`;
 }
 
 function decodeContent(stored: string): ParsedContent {
+  if (stored.startsWith('text_rich:')) {
+    try {
+      const data = JSON.parse(stored.slice(9));
+      return { kind: 'text', value: data.text, entities: data.entities };
+    } catch {
+      return { kind: 'text', value: stored.slice(9) };
+    }
+  }
   if (stored.startsWith('text:')) return { kind: 'text', value: stored.slice(5) };
   if (stored.startsWith('sticker:')) return { kind: 'sticker', value: stored.slice(8) };
   if (stored.startsWith('voice:')) return { kind: 'voice', value: stored.slice(6) };
   return { kind: 'text', value: stored };
+}
+
+// Parse response content preserving original text case and custom emoji entities
+function parseResponseContent(msg: any): ParsedContent | null {
+  if (typeof msg?.text === 'string' && msg.text.trim().length > 0) {
+    const text = msg.text.trim();
+    // Check for custom_emoji entities (premium emoji)
+    const customEmojiEntities = (msg.entities || []).filter((e: any) => e.type === 'custom_emoji');
+    if (customEmojiEntities.length > 0) {
+      return { kind: 'text_rich', value: text, entities: customEmojiEntities };
+    }
+    return { kind: 'text', value: text.replace(/\s+/g, ' ').toLocaleLowerCase() };
+  }
+  if (msg?.sticker?.file_id) {
+    return { kind: 'sticker', value: msg.sticker.file_id };
+  }
+  if (msg?.voice?.file_id) {
+    return { kind: 'voice', value: msg.voice.file_id };
+  }
+  if (msg?.audio?.file_id) {
+    return { kind: 'voice', value: msg.audio.file_id };
+  }
+  return null;
 }
 
 function pointerCacheKey(botId: string, triggerKey: string) {
