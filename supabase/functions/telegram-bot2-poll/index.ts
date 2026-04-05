@@ -709,12 +709,16 @@ async function tryRespond(
       allow_sending_without_reply: true,
     });
   } else {
-    await callTelegram(bot.api_key, 'sendMessage', {
+    const payload: Record<string, unknown> = {
       chat_id: msg.chat.id,
       text: selected.value,
       reply_to_message_id: msg.message_id,
       allow_sending_without_reply: true,
-    });
+    };
+    if (selected.entities && selected.entities.length > 0) {
+      payload.entities = selected.entities;
+    }
+    await callTelegram(bot.api_key, 'sendMessage', payload);
   }
 
   const nextPtr = (ptr + 1) % responses.length;
