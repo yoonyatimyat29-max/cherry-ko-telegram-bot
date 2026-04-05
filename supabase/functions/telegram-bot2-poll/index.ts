@@ -559,7 +559,7 @@ function collectLearnedPairs(messages: any[]): LearnedPair[] {
     if (!msg?.reply_to_message) continue;
 
     const triggerContent = parseContent(msg.reply_to_message);
-    const responseContent = parseContent(msg);
+    const responseContent = parseResponseContent(msg);
     if (!triggerContent || !responseContent) continue;
 
     const triggerKey = encodeContent(triggerContent);
