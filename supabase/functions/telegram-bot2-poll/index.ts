@@ -447,7 +447,19 @@ async function handleStart(bot: BotRow, msg: any) {
 
   const greeting = '👋 မင်္ဂလာပါ! Group ထဲထည့်ပေးပါ။\n\nGroup ထဲမှာ User တွေ Reply နဲ့ စကားပြန်ပြောပေးမယ်';
   const keyboard: any[][] = [];
-  if (bot.start_link) {
+
+  // Fetch bot_links from database
+  const { data: botLinks } = await supabase
+    .from('bot_links')
+    .select('link_title, link_url')
+    .eq('bot_id', bot.id)
+    .order('created_at', { ascending: true });
+
+  if (botLinks && botLinks.length > 0) {
+    for (const link of botLinks) {
+      keyboard.push([{ text: link.link_title, url: link.link_url }]);
+    }
+  } else if (bot.start_link) {
     keyboard.push([{ text: '📢 Join ပေးပါရန်', url: bot.start_link }]);
   }
   keyboard.push([{ text: '➕ Group ထဲ ထည့်ရန်', url: `https://t.me/${bot.bot_username}?startgroup=true` }]);
