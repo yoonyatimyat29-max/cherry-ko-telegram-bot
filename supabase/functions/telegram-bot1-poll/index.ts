@@ -356,9 +356,43 @@ Deno.serve(async (req) => {
 
         if (!convo) { totalProcessed++; continue; }
 
-        // Handle link setting
-        if (convo.state.startsWith('waiting_link:')) {
-          const botId = convo.state.replace('waiting_link:', '');
+        // Handle link title input
+        if (convo.state.startsWith('waiting_link_title:')) {
+          const botId = convo.state.replace('waiting_link_title:', '');
+          const title = text;
+
+          if (!title || title.length > 64) {
+            await callGateway('sendMessage', {
+              chat_id: chatId,
+              text: '❌ Title ကို 1-64 characters အတွင်း ထည့်ပါ။',
+            }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+            totalProcessed++;
+            continue;
+          }
+
+          // Encode title in state (base64-safe)
+          const encodedTitle = btoa(unescape(encodeURIComponent(title)));
+          await supabase
+            .from('bot1_conversations')
+            .update({ state: `waiting_link_url:${botId}:${encodedTitle}`, updated_at: new Date().toISOString() })
+            .eq('chat_id', chatId);
+
+          await callGateway('sendMessage', {
+            chat_id: chatId,
+            text: `✅ Title: "${title}"\n\n🔗 ယခု Link URL ကို ပို့ပေးပါ။\n\nဥပမာ: https://t.me/your_channel`,
+          }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+
+          totalProcessed++;
+          continue;
+        }
+
+        // Handle link URL input
+        if (convo.state.startsWith('waiting_link_url:')) {
+          const stateData = convo.state.replace('waiting_link_url:', '');
+          const colonIdx = stateData.indexOf(':');
+          const botId = stateData.substring(0, colonIdx);
+          const encodedTitle = stateData.substring(colonIdx + 1);
+          const linkTitle = decodeURIComponent(escape(atob(encodedTitle)));
           const link = text;
 
           if (!link.startsWith('https://') && !link.startsWith('http://') && !link.startsWith('t.me/')) {
@@ -381,13 +415,16 @@ Deno.serve(async (req) => {
           if (!bot || String(bot.owner_chat_id) !== String(chatId)) {
             await callGateway('sendMessage', { chat_id: chatId, text: '❌ ခွင့်မရှိပါ။' }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
           } else {
-            await supabase.from('bots').update({ start_link: finalLink }).eq('id', botId);
+            await supabase.from('bot_links').insert({ bot_id: botId, link_url: finalLink, link_title: linkTitle });
             await supabase.from('bot1_conversations').update({ state: 'idle', updated_at: new Date().toISOString() }).eq('chat_id', chatId);
 
             await callGateway('sendMessage', {
               chat_id: chatId,
-              text: `✅ @${bot.bot_username} ရဲ့ /start Link ကို သတ်မှတ်ပြီးပါပြီ!\n\n🔗 ${finalLink}`,
-              reply_markup: { inline_keyboard: [[{ text: '🔙 Bot စီမံရန်', callback_data: `manage_bot:${botId}` }]] },
+              text: `✅ Link ထည့်ပြီးပါပြီ!\n\n📌 ${linkTitle}\n🔗 ${finalLink}`,
+              reply_markup: { inline_keyboard: [
+                [{ text: '➕ နောက်ထပ် Link ထည့်ရန်', callback_data: `add_link:${botId}` }],
+                [{ text: '🔙 Bot စီမံရန်', callback_data: `manage_bot:${botId}` }],
+              ] },
             }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
           }
 
