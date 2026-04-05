@@ -19,8 +19,8 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-type ContentKind = 'text' | 'sticker' | 'voice';
-type ParsedContent = { kind: ContentKind; value: string };
+type ContentKind = 'text' | 'sticker' | 'voice' | 'text_rich';
+type ParsedContent = { kind: ContentKind; value: string; entities?: any[] };
 type BotRow = { id: string; api_key: string; bot_username: string | null; start_link: string | null };
 type ForwardJobRow = {
   id: string;
