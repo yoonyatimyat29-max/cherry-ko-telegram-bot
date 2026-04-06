@@ -126,7 +126,7 @@ async function pollSingleBot(
 ): Promise<PollResult> {
   let processed = 0;
   const offset = stateMap.get(bot.id) || 0;
-  const hadForwardProgressBeforePoll = await processPendingForwardJobs(supabase, bot);
+  let hadForwardProgress = false;
 
   try {
     const data = await callTelegram(bot.api_key, 'getUpdates', {
@@ -138,13 +138,18 @@ async function pollSingleBot(
     if (!data.ok) {
       if (String(data.error_code) === '409' && String(data.description || '').toLowerCase().includes('webhook')) {
         await callTelegram(bot.api_key, 'deleteWebhook', { drop_pending_updates: false });
+      } else if (String(data.error_code) === '409') {
+        console.warn(`@${bot.bot_username}: getUpdates overlap detected`);
+      } else {
+        console.error(`@${bot.bot_username}: getUpdates failed`, data);
       }
-      return { processed: 0, hadUpdates: hadForwardProgressBeforePoll };
+      return { processed: 0, hadUpdates: hadForwardProgress };
     }
 
     const updates = Array.isArray(data.result) ? data.result : [];
     if (updates.length === 0) {
-      return { processed: 0, hadUpdates: hadForwardProgressBeforePoll };
+      hadForwardProgress = await processPendingForwardJobs(supabase, bot);
+      return { processed: 0, hadUpdates: hadForwardProgress };
     }
 
     // Handle channel posts from owner's channel
@@ -159,7 +164,7 @@ async function pollSingleBot(
       }
     }
 
-    await processPendingForwardJobs(supabase, bot);
+    hadForwardProgress = await processPendingForwardJobs(supabase, bot);
 
     const messages = updates.map((update: any) => update.message).filter(Boolean);
     const chatRecords = collectChatRecords(bot.id, messages, chatBotMap);
@@ -253,7 +258,7 @@ async function pollSingleBot(
     console.error(`Poll error @${bot.bot_username}:`, err);
   }
 
-  return { processed, hadUpdates: true };
+  return { processed, hadUpdates: processed > 0 || hadForwardProgress };
 }
 
 async function enqueueChannelForwardJob(supabase: any, bot: BotRow, post: any) {
@@ -694,15 +699,17 @@ async function tryRespond(
   callTelegram(bot.api_key, 'sendChatAction', { chat_id: msg.chat.id, action }).catch(() => {});
   await delay(highLoad ? 20 + Math.random() * 40 : 45 + Math.random() * 90);
 
+  let sendResult: any;
+
   if (selected.kind === 'sticker') {
-    await callTelegram(bot.api_key, 'sendSticker', {
+    sendResult = await callTelegramWithRetry(bot.api_key, 'sendSticker', {
       chat_id: msg.chat.id,
       sticker: selected.value,
       reply_to_message_id: msg.message_id,
       allow_sending_without_reply: true,
     });
   } else if (selected.kind === 'voice') {
-    await callTelegram(bot.api_key, 'sendVoice', {
+    sendResult = await callTelegramWithRetry(bot.api_key, 'sendVoice', {
       chat_id: msg.chat.id,
       voice: selected.value,
       reply_to_message_id: msg.message_id,
@@ -718,7 +725,12 @@ async function tryRespond(
     if (selected.entities && selected.entities.length > 0) {
       payload.entities = selected.entities;
     }
-    await callTelegram(bot.api_key, 'sendMessage', payload);
+    sendResult = await callTelegramWithRetry(bot.api_key, 'sendMessage', payload);
+  }
+
+  if (!sendResult?.ok) {
+    console.error(`@${bot.bot_username}: reply failed`, sendResult);
+    return false;
   }
 
   const nextPtr = (ptr + 1) % responses.length;
