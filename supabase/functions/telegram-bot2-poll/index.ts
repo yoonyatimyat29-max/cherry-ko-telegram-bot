@@ -1,12 +1,12 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
-const MAX_RUNTIME_MS = 55_000;
+const MAX_RUNTIME_MS = 50_000;
 const MIN_REMAINING_MS = 5_000;
 const TELEGRAM_TIMEOUT_MS = 8_000;
-const IDLE_DELAY_MS = 150;
-const BOT_POLL_CONCURRENCY = 12;
-const CHANNEL_FORWARD_PAGE_SIZE = 150;
-const CHANNEL_FORWARD_CHUNK_SIZE = 20;
+const IDLE_DELAY_MS = 250;
+const BOT_POLL_CONCURRENCY = 8;
+const CHANNEL_FORWARD_PAGE_SIZE = 60;
+const CHANNEL_FORWARD_CHUNK_SIZE = 10;
 const TELEGRAM_RETRY_ATTEMPTS = 4;
 const REACTION_EMOJIS = ['❤️', '🔥', '👍', '😂', '🎉', '❤️‍🔥', '💯', '😍', '👏', '🤩'];
 
