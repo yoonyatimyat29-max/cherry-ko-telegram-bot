@@ -7,6 +7,7 @@ const IDLE_DELAY_MS = 250;
 const BOT_POLL_CONCURRENCY = 8;
 const CHANNEL_FORWARD_PAGE_SIZE = 60;
 const CHANNEL_FORWARD_CHUNK_SIZE = 10;
+const CACHE_WARM_BATCH_SIZE = 25;
 const TELEGRAM_RETRY_ATTEMPTS = 4;
 const REACTION_EMOJIS = ['❤️', '🔥', '👍', '😂', '🎉', '❤️‍🔥', '💯', '😍', '👏', '🤩'];
 
@@ -126,7 +127,7 @@ async function pollSingleBot(
 ): Promise<PollResult> {
   let processed = 0;
   const offset = stateMap.get(bot.id) || 0;
-  let hadForwardProgress = false;
+    let hadForwardProgress = false;
 
   try {
     const data = await callTelegram(bot.api_key, 'getUpdates', {
@@ -163,8 +164,6 @@ async function pollSingleBot(
         await enqueueChannelForwardJob(supabase, bot, post);
       }
     }
-
-    hadForwardProgress = await processPendingForwardJobs(supabase, bot);
 
     const messages = updates.map((update: any) => update.message).filter(Boolean);
     const chatRecords = collectChatRecords(bot.id, messages, chatBotMap);
@@ -254,6 +253,8 @@ async function pollSingleBot(
       { bot_id: bot.id, update_offset: newOffset, updated_at: new Date().toISOString() },
       { onConflict: 'bot_id' }
     );
+
+    hadForwardProgress = (await processPendingForwardJobs(supabase, bot)) || hadForwardProgress;
   } catch (err) {
     console.error(`Poll error @${bot.bot_username}:`, err);
   }
@@ -585,19 +586,24 @@ async function learnPairsBatch(
   const triggerKeys = Array.from(new Set(pairs.map((pair) => pair.triggerKey)));
   if (triggerKeys.length === 0) return;
 
-  const { data: existingRows, error: existingError } = await supabase
-    .from('trigger_responses')
-    .select('trigger_text, response_text')
-    .in('trigger_text', triggerKeys);
+  const existingPairs = new Set<string>();
 
-  if (existingError) {
-    console.error('Failed to check existing learned pairs:', existingError);
-    return;
+  for (const batch of chunkArray(triggerKeys, CACHE_WARM_BATCH_SIZE)) {
+    const { data: existingRows, error: existingError } = await supabase
+      .from('trigger_responses')
+      .select('trigger_text, response_text')
+      .eq('bot_id', botId)
+      .in('trigger_text', batch);
+
+    if (existingError) {
+      console.error('Failed to check existing learned pairs:', existingError);
+      return;
+    }
+
+    for (const row of existingRows || []) {
+      existingPairs.add(`${row.trigger_text}=>${row.response_text}`);
+    }
   }
-
-  const existingPairs = new Set(
-    (existingRows || []).map((row: any) => `${row.trigger_text}=>${row.response_text}`)
-  );
 
   const inserts = pairs
     .filter((pair) => !existingPairs.has(`${pair.triggerKey}=>${pair.responseKey}`))
@@ -616,7 +622,7 @@ async function learnPairsBatch(
   }
 
   for (const pair of pairs) {
-    const cachedResponses = responseCache.get(pair.triggerKey);
+    const cachedResponses = responseCache.get(responseCacheKey(botId, pair.triggerKey));
     if (cachedResponses && !cachedResponses.includes(pair.responseKey)) {
       cachedResponses.push(pair.responseKey);
     }
@@ -631,25 +637,30 @@ async function warmCaches(
   responseCache: Map<string, string[]>,
   pointerCache: Map<string, number>,
 ) {
-  const missingResponseKeys = exactKeys.filter((key) => !responseCache.has(key));
+  const missingResponseKeys = exactKeys.filter((key) => !responseCache.has(responseCacheKey(botId, key)));
   if (missingResponseKeys.length > 0) {
     for (const key of missingResponseKeys) {
-      responseCache.set(key, []);
+      responseCache.set(responseCacheKey(botId, key), []);
     }
 
-    const { data: responseRows, error } = await supabase
-      .from('trigger_responses')
-      .select('trigger_text, response_text, created_at')
-      .in('trigger_text', missingResponseKeys)
-      .order('created_at', { ascending: true });
+    for (const batch of chunkArray(missingResponseKeys, CACHE_WARM_BATCH_SIZE)) {
+      const { data: responseRows, error } = await supabase
+        .from('trigger_responses')
+        .select('trigger_text, response_text, created_at')
+        .eq('bot_id', botId)
+        .in('trigger_text', batch)
+        .order('created_at', { ascending: true });
 
-    if (error) {
-      console.error('Failed to warm response cache:', error);
-    } else {
+      if (error) {
+        console.error('Failed to warm response cache:', error);
+        break;
+      }
+
       for (const row of responseRows || []) {
-        const existing = responseCache.get(row.trigger_text) ?? [];
+        const cacheKey = responseCacheKey(botId, row.trigger_text);
+        const existing = responseCache.get(cacheKey) ?? [];
         existing.push(row.response_text);
-        responseCache.set(row.trigger_text, existing);
+        responseCache.set(cacheKey, existing);
       }
     }
   }
@@ -661,19 +672,21 @@ async function warmCaches(
     pointerCache.set(pointerCacheKey(botId, key), 0);
   }
 
-  const { data: pointerRows, error } = await supabase
-    .from('trigger_pointers')
-    .select('trigger_text, pointer')
-    .eq('bot_id', botId)
-    .in('trigger_text', missingPointerKeys);
+  for (const batch of chunkArray(missingPointerKeys, CACHE_WARM_BATCH_SIZE)) {
+    const { data: pointerRows, error } = await supabase
+      .from('trigger_pointers')
+      .select('trigger_text, pointer')
+      .eq('bot_id', botId)
+      .in('trigger_text', batch);
 
-  if (error) {
-    console.error('Failed to warm pointer cache:', error);
-    return;
-  }
+    if (error) {
+      console.error('Failed to warm pointer cache:', error);
+      return;
+    }
 
-  for (const row of pointerRows || []) {
-    pointerCache.set(pointerCacheKey(botId, row.trigger_text), row.pointer || 0);
+    for (const row of pointerRows || []) {
+      pointerCache.set(pointerCacheKey(botId, row.trigger_text), row.pointer || 0);
+    }
   }
 }
 
@@ -687,7 +700,7 @@ async function tryRespond(
   pointerCache: Map<string, number>,
   pointerUpdates: Map<string, number>,
 ) {
-  const responses = responseCache.get(exactKey) ?? [];
+  const responses = responseCache.get(responseCacheKey(bot.id, exactKey)) ?? [];
   if (responses.length === 0) return false;
 
   const cacheKey = pointerCacheKey(bot.id, exactKey);
@@ -891,6 +904,10 @@ function parseResponseContent(msg: any): ParsedContent | null {
 }
 
 function pointerCacheKey(botId: string, triggerKey: string) {
+  return `${botId}:${triggerKey}`;
+}
+
+function responseCacheKey(botId: string, triggerKey: string) {
   return `${botId}:${triggerKey}`;
 }
 
