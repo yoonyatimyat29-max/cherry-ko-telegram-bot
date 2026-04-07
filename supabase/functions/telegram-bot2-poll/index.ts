@@ -254,9 +254,7 @@ async function pollSingleBot(
       { onConflict: 'bot_id' }
     );
 
-    if (MAX_RUNTIME_MS - (Date.now() - performance.timeOrigin) > MIN_REMAINING_MS) {
-      hadForwardProgress = (await processPendingForwardJobs(supabase, bot)) || hadForwardProgress;
-    }
+    hadForwardProgress = (await processPendingForwardJobs(supabase, bot)) || hadForwardProgress;
   } catch (err) {
     console.error(`Poll error @${bot.bot_username}:`, err);
   }
