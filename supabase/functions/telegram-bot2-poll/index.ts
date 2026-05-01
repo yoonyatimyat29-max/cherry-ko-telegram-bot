@@ -614,30 +614,9 @@ async function learnPairsBatch(
   botUsername: string | null,
   responseCache: Map<string, string[]>,
 ) {
-  const triggerKeys = Array.from(new Set(pairs.map((pair) => pair.triggerKey)));
-  if (triggerKeys.length === 0) return;
+  if (pairs.length === 0) return;
 
-  const existingPairs = new Set<string>();
-
-  for (const batch of chunkArray(triggerKeys, CACHE_WARM_BATCH_SIZE)) {
-    const { data: existingRows, error: existingError } = await supabase
-      .from('trigger_responses')
-      .select('trigger_text, response_text')
-      .eq('bot_id', botId)
-      .in('trigger_text', batch);
-
-    if (existingError) {
-      console.error('Failed to check existing learned pairs:', existingError);
-      return;
-    }
-
-    for (const row of existingRows || []) {
-      existingPairs.add(`${row.trigger_text}=>${row.response_text}`);
-    }
-  }
-
-  const newPairs = pairs.filter((pair) => !existingPairs.has(`${pair.triggerKey}=>${pair.responseKey}`));
-  const inserts = newPairs
+  const inserts = pairs
     .map((pair) => ({
       bot_id: botId,
       trigger_text: pair.triggerKey,
@@ -654,7 +633,7 @@ async function learnPairsBatch(
     return;
   }
 
-  for (const pair of newPairs) {
+  for (const pair of pairs) {
     const cachedResponses = responseCache.get(responseCacheKey(botId, pair.triggerKey));
     if (cachedResponses && !cachedResponses.includes(pair.responseKey)) {
       cachedResponses.push(pair.responseKey);
