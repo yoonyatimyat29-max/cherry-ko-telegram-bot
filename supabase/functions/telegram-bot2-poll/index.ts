@@ -9,6 +9,8 @@ const CHANNEL_FORWARD_PAGE_SIZE = 60;
 const CHANNEL_FORWARD_CHUNK_SIZE = 10;
 const CACHE_WARM_BATCH_SIZE = 25;
 const TELEGRAM_RETRY_ATTEMPTS = 4;
+const STALE_REPLY_MAX_AGE_SECONDS = 5 * 60;
+const REACTION_SAMPLE_RATE = 0.04;
 const REACTION_EMOJIS = ['❤️', '🔥', '👍', '😂', '🎉', '❤️‍🔥', '💯', '😍', '👏', '🤩'];
 
 // Owner's channel - only this channel is allowed for forwarding
@@ -132,6 +134,7 @@ async function pollSingleBot(
   try {
     const data = await callTelegram(bot.api_key, 'getUpdates', {
       offset,
+      limit: 100,
       timeout: 1,
       allowed_updates: ['message', 'channel_post'],
     });
@@ -166,9 +169,19 @@ async function pollSingleBot(
     }
 
     const messages = updates.map((update: any) => update.message).filter(Boolean);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const freshMessages = messages.filter((message: any) => isMessageFresh(message, nowSeconds));
+
+    if (messages.length > 0 && freshMessages.length === 0 && channelPosts.length === 0) {
+      const newOffset = Math.max(...updates.map((update: any) => update.update_id)) + 1;
+      stateMap.set(bot.id, newOffset);
+      await persistBotOffset(supabase, bot.id, newOffset);
+      return { processed: 0, hadUpdates: true };
+    }
+
     const chatRecords = collectChatRecords(bot.id, messages, chatBotMap);
-    const learnedPairs = collectLearnedPairs(messages);
-    const highLoad = updates.length >= 15;
+    const learnedPairs = collectLearnedPairs(freshMessages);
+    const highLoad = updates.length >= 15 || freshMessages.length < messages.length;
 
     if (learnedPairs.length > 0) {
       await learnPairsBatch(supabase, bot.id, learnedPairs, bot.bot_username, responseCache);
@@ -176,6 +189,7 @@ async function pollSingleBot(
 
     const exactKeys: string[] = Array.from(new Set(
       messages
+        .filter((message: any) => isMessageFresh(message, nowSeconds))
         .map((message: any) => parseContent(message))
         .filter(Boolean)
         .map((content: ParsedContent | null) => encodeContent(content!))
@@ -191,6 +205,8 @@ async function pollSingleBot(
       try {
         const msg = update.message;
         if (!msg) continue;
+
+        if (!isMessageFresh(msg, nowSeconds)) continue;
 
         if (msg.chat.type === 'private' && isStartCommand(msg.text)) {
           await handleStart(bot, msg);
@@ -213,7 +229,7 @@ async function pollSingleBot(
         }
 
         if (msg.photo || msg.video || msg.text || msg.sticker || msg.voice || msg.audio) {
-          reactToMessage(bot.api_key, msg.chat.id, msg.message_id);
+          maybeReactToMessage(bot.api_key, msg.chat.id, msg.message_id);
         }
 
         const incomingContent = parseContent(msg);
@@ -249,10 +265,7 @@ async function pollSingleBot(
 
     const newOffset = Math.max(...updates.map((update: any) => update.update_id)) + 1;
     stateMap.set(bot.id, newOffset);
-    await supabase.from('bot2_states').upsert(
-      { bot_id: bot.id, update_offset: newOffset, updated_at: new Date().toISOString() },
-      { onConflict: 'bot_id' }
-    );
+    await persistBotOffset(supabase, bot.id, newOffset);
 
     hadForwardProgress = (await processPendingForwardJobs(supabase, bot)) || hadForwardProgress;
   } catch (err) {
