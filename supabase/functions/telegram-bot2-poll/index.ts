@@ -652,7 +652,7 @@ async function learnPairsBatch(
     return;
   }
 
-  for (const pair of pairs) {
+  for (const pair of inserts) {
     const cachedResponses = responseCache.get(responseCacheKey(botId, pair.triggerKey));
     if (cachedResponses && !cachedResponses.includes(pair.responseKey)) {
       cachedResponses.push(pair.responseKey);
