@@ -267,7 +267,9 @@ async function pollSingleBot(
     stateMap.set(bot.id, newOffset);
     await persistBotOffset(supabase, bot.id, newOffset);
 
-    hadForwardProgress = (await processPendingForwardJobs(supabase, bot)) || hadForwardProgress;
+    if (freshMessages.length === 0) {
+      hadForwardProgress = (await processPendingForwardJobs(supabase, bot)) || hadForwardProgress;
+    }
   } catch (err) {
     console.error(`Poll error @${bot.bot_username}:`, err);
   }
