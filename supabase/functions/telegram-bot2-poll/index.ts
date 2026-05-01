@@ -529,6 +529,22 @@ async function upsertChats(supabase: any, rows: ChatRecord[]) {
   }
 }
 
+async function persistBotOffset(supabase: any, botId: string, updateOffset: number) {
+  const { error } = await supabase.from('bot2_states').upsert(
+    { bot_id: botId, update_offset: updateOffset, updated_at: new Date().toISOString() },
+    { onConflict: 'bot_id' }
+  );
+  if (error) {
+    console.error('Failed to persist bot offset:', error);
+  }
+}
+
+function isMessageFresh(msg: any, nowSeconds = Math.floor(Date.now() / 1000)) {
+  const messageDate = Number(msg?.date || 0);
+  if (!Number.isFinite(messageDate) || messageDate <= 0) return true;
+  return nowSeconds - messageDate <= STALE_REPLY_MAX_AGE_SECONDS;
+}
+
 async function hydrateChatBotsForChat(
   supabase: any,
   chatBotMap: Map<number, string[]>,
@@ -628,7 +644,9 @@ async function learnPairsBatch(
 
   if (inserts.length === 0) return;
 
-  const { error } = await supabase.from('trigger_responses').insert(inserts);
+  const { error } = await supabase
+    .from('trigger_responses')
+    .upsert(inserts, { onConflict: 'bot_id,trigger_text,response_text', ignoreDuplicates: true });
   if (error) {
     console.error('Failed to insert learned pairs:', error);
     return;
@@ -779,7 +797,8 @@ async function persistPointerUpdates(supabase: any, botId: string, pointerUpdate
   }
 }
 
-function reactToMessage(apiKey: string, chatId: number, messageId: number) {
+function maybeReactToMessage(apiKey: string, chatId: number, messageId: number) {
+  if (Math.random() > REACTION_SAMPLE_RATE) return;
   const emoji = REACTION_EMOJIS[Math.floor(Math.random() * REACTION_EMOJIS.length)];
   callTelegram(apiKey, 'setMessageReaction', {
     chat_id: chatId,
