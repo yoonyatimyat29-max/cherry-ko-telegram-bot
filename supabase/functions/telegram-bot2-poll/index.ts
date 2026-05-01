@@ -9,7 +9,7 @@ const CHANNEL_FORWARD_PAGE_SIZE = 60;
 const CHANNEL_FORWARD_CHUNK_SIZE = 10;
 const CACHE_WARM_BATCH_SIZE = 25;
 const TELEGRAM_RETRY_ATTEMPTS = 4;
-const STALE_REPLY_MAX_AGE_SECONDS = 5 * 60;
+const STALE_REPLY_MAX_AGE_SECONDS = 2 * 60;
 const REACTION_SAMPLE_RATE = 0.04;
 const REACTION_EMOJIS = ['❤️', '🔥', '👍', '😂', '🎉', '❤️‍🔥', '💯', '😍', '👏', '🤩'];
 
