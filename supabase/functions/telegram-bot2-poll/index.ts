@@ -634,8 +634,8 @@ async function learnPairsBatch(
     }
   }
 
-  const inserts = pairs
-    .filter((pair) => !existingPairs.has(`${pair.triggerKey}=>${pair.responseKey}`))
+  const newPairs = pairs.filter((pair) => !existingPairs.has(`${pair.triggerKey}=>${pair.responseKey}`));
+  const inserts = newPairs
     .map((pair) => ({
       bot_id: botId,
       trigger_text: pair.triggerKey,
@@ -652,7 +652,7 @@ async function learnPairsBatch(
     return;
   }
 
-  for (const pair of inserts) {
+  for (const pair of newPairs) {
     const cachedResponses = responseCache.get(responseCacheKey(botId, pair.triggerKey));
     if (cachedResponses && !cachedResponses.includes(pair.responseKey)) {
       cachedResponses.push(pair.responseKey);
