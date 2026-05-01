@@ -9,6 +9,8 @@ const CHANNEL_FORWARD_PAGE_SIZE = 60;
 const CHANNEL_FORWARD_CHUNK_SIZE = 10;
 const CACHE_WARM_BATCH_SIZE = 25;
 const TELEGRAM_RETRY_ATTEMPTS = 4;
+const STALE_REPLY_MAX_AGE_SECONDS = 5 * 60;
+const REACTION_SAMPLE_RATE = 0.04;
 const REACTION_EMOJIS = ['❤️', '🔥', '👍', '😂', '🎉', '❤️‍🔥', '💯', '😍', '👏', '🤩'];
 
 // Owner's channel - only this channel is allowed for forwarding
@@ -132,6 +134,7 @@ async function pollSingleBot(
   try {
     const data = await callTelegram(bot.api_key, 'getUpdates', {
       offset,
+      limit: 100,
       timeout: 1,
       allowed_updates: ['message', 'channel_post'],
     });
@@ -166,9 +169,19 @@ async function pollSingleBot(
     }
 
     const messages = updates.map((update: any) => update.message).filter(Boolean);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const freshMessages = messages.filter((message: any) => isMessageFresh(message, nowSeconds));
+
+    if (messages.length > 0 && freshMessages.length === 0 && channelPosts.length === 0) {
+      const newOffset = Math.max(...updates.map((update: any) => update.update_id)) + 1;
+      stateMap.set(bot.id, newOffset);
+      await persistBotOffset(supabase, bot.id, newOffset);
+      return { processed: 0, hadUpdates: true };
+    }
+
     const chatRecords = collectChatRecords(bot.id, messages, chatBotMap);
-    const learnedPairs = collectLearnedPairs(messages);
-    const highLoad = updates.length >= 15;
+    const learnedPairs = collectLearnedPairs(freshMessages);
+    const highLoad = updates.length >= 15 || freshMessages.length < messages.length;
 
     if (learnedPairs.length > 0) {
       await learnPairsBatch(supabase, bot.id, learnedPairs, bot.bot_username, responseCache);
@@ -176,6 +189,7 @@ async function pollSingleBot(
 
     const exactKeys: string[] = Array.from(new Set(
       messages
+        .filter((message: any) => isMessageFresh(message, nowSeconds))
         .map((message: any) => parseContent(message))
         .filter(Boolean)
         .map((content: ParsedContent | null) => encodeContent(content!))
@@ -191,6 +205,8 @@ async function pollSingleBot(
       try {
         const msg = update.message;
         if (!msg) continue;
+
+        if (!isMessageFresh(msg, nowSeconds)) continue;
 
         if (msg.chat.type === 'private' && isStartCommand(msg.text)) {
           await handleStart(bot, msg);
@@ -213,7 +229,7 @@ async function pollSingleBot(
         }
 
         if (msg.photo || msg.video || msg.text || msg.sticker || msg.voice || msg.audio) {
-          reactToMessage(bot.api_key, msg.chat.id, msg.message_id);
+          maybeReactToMessage(bot.api_key, msg.chat.id, msg.message_id);
         }
 
         const incomingContent = parseContent(msg);
@@ -249,12 +265,11 @@ async function pollSingleBot(
 
     const newOffset = Math.max(...updates.map((update: any) => update.update_id)) + 1;
     stateMap.set(bot.id, newOffset);
-    await supabase.from('bot2_states').upsert(
-      { bot_id: bot.id, update_offset: newOffset, updated_at: new Date().toISOString() },
-      { onConflict: 'bot_id' }
-    );
+    await persistBotOffset(supabase, bot.id, newOffset);
 
-    hadForwardProgress = (await processPendingForwardJobs(supabase, bot)) || hadForwardProgress;
+    if (freshMessages.length === 0) {
+      hadForwardProgress = (await processPendingForwardJobs(supabase, bot)) || hadForwardProgress;
+    }
   } catch (err) {
     console.error(`Poll error @${bot.bot_username}:`, err);
   }
@@ -516,6 +531,22 @@ async function upsertChats(supabase: any, rows: ChatRecord[]) {
   }
 }
 
+async function persistBotOffset(supabase: any, botId: string, updateOffset: number) {
+  const { error } = await supabase.from('bot2_states').upsert(
+    { bot_id: botId, update_offset: updateOffset, updated_at: new Date().toISOString() },
+    { onConflict: 'bot_id' }
+  );
+  if (error) {
+    console.error('Failed to persist bot offset:', error);
+  }
+}
+
+function isMessageFresh(msg: any, nowSeconds = Math.floor(Date.now() / 1000)) {
+  const messageDate = Number(msg?.date || 0);
+  if (!Number.isFinite(messageDate) || messageDate <= 0) return true;
+  return nowSeconds - messageDate <= STALE_REPLY_MAX_AGE_SECONDS;
+}
+
 async function hydrateChatBotsForChat(
   supabase: any,
   chatBotMap: Map<number, string[]>,
@@ -583,30 +614,9 @@ async function learnPairsBatch(
   botUsername: string | null,
   responseCache: Map<string, string[]>,
 ) {
-  const triggerKeys = Array.from(new Set(pairs.map((pair) => pair.triggerKey)));
-  if (triggerKeys.length === 0) return;
-
-  const existingPairs = new Set<string>();
-
-  for (const batch of chunkArray(triggerKeys, CACHE_WARM_BATCH_SIZE)) {
-    const { data: existingRows, error: existingError } = await supabase
-      .from('trigger_responses')
-      .select('trigger_text, response_text')
-      .eq('bot_id', botId)
-      .in('trigger_text', batch);
-
-    if (existingError) {
-      console.error('Failed to check existing learned pairs:', existingError);
-      return;
-    }
-
-    for (const row of existingRows || []) {
-      existingPairs.add(`${row.trigger_text}=>${row.response_text}`);
-    }
-  }
+  if (pairs.length === 0) return;
 
   const inserts = pairs
-    .filter((pair) => !existingPairs.has(`${pair.triggerKey}=>${pair.responseKey}`))
     .map((pair) => ({
       bot_id: botId,
       trigger_text: pair.triggerKey,
@@ -615,7 +625,9 @@ async function learnPairsBatch(
 
   if (inserts.length === 0) return;
 
-  const { error } = await supabase.from('trigger_responses').insert(inserts);
+  const { error } = await supabase
+    .from('trigger_responses')
+    .upsert(inserts, { onConflict: 'bot_id,trigger_text,response_text', ignoreDuplicates: true });
   if (error) {
     console.error('Failed to insert learned pairs:', error);
     return;
@@ -766,7 +778,8 @@ async function persistPointerUpdates(supabase: any, botId: string, pointerUpdate
   }
 }
 
-function reactToMessage(apiKey: string, chatId: number, messageId: number) {
+function maybeReactToMessage(apiKey: string, chatId: number, messageId: number) {
+  if (Math.random() > REACTION_SAMPLE_RATE) return;
   const emoji = REACTION_EMOJIS[Math.floor(Math.random() * REACTION_EMOJIS.length)];
   callTelegram(apiKey, 'setMessageReaction', {
     chat_id: chatId,
