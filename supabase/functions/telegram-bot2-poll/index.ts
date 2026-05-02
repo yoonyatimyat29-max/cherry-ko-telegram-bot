@@ -25,6 +25,7 @@ type ContentKind = 'text' | 'sticker' | 'voice' | 'text_rich';
 type ParsedContent = { kind: ContentKind; value: string; entities?: any[] };
 type BotRow = { id: string; api_key: string; bot_username: string | null; start_link: string | null };
 // (channel forward jobs removed — broadcasts are now sent immediately)
+type BroadcastClaim = { id: string };
 type ChatRecord = {
   bot_id: string;
   chat_id: number;
@@ -271,6 +272,9 @@ async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Prom
   const sourceMessageId = Number(post.message_id);
   if (!Number.isFinite(sourceChatId) || !Number.isFinite(sourceMessageId)) return 0;
 
+  const claim = await claimBroadcastOnce(supabase, bot, sourceChatId, sourceMessageId);
+  if (!claim) return 0;
+
   let totalSent = 0;
   let lastChatId = -Infinity;
 
@@ -335,8 +339,46 @@ async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Prom
     if (recipients.length < BROADCAST_PAGE_SIZE) break;
   }
 
+  await supabase
+    .from('bot_broadcast_deliveries')
+    .update({
+      status: 'completed',
+      delivered_count: totalSent,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', claim.id);
+
   console.log(`@${bot.bot_username}: broadcast post ${sourceMessageId} → ${totalSent} chats`);
   return totalSent;
+}
+
+async function claimBroadcastOnce(
+  supabase: any,
+  bot: BotRow,
+  sourceChatId: number,
+  sourceMessageId: number,
+): Promise<BroadcastClaim | null> {
+  const { data, error } = await supabase
+    .from('bot_broadcast_deliveries')
+    .insert({
+      bot_id: bot.id,
+      source_chat_id: sourceChatId,
+      source_message_id: sourceMessageId,
+      status: 'processing',
+    })
+    .select('id')
+    .single();
+
+  if (!error && data?.id) return data;
+
+  if (error?.code === '23505' || /duplicate key|bot_broadcast_deliveries/i.test(String(error?.message || ''))) {
+    console.log(`@${bot.bot_username}: skipped duplicate broadcast post ${sourceMessageId}`);
+    return null;
+  }
+
+  console.error(`@${bot.bot_username}: broadcast claim failed`, error);
+  return null;
 }
 
 async function handleStart(bot: BotRow, msg: any) {
