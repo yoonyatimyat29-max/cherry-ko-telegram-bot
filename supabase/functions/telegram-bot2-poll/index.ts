@@ -24,18 +24,7 @@ const corsHeaders = {
 type ContentKind = 'text' | 'sticker' | 'voice' | 'text_rich';
 type ParsedContent = { kind: ContentKind; value: string; entities?: any[] };
 type BotRow = { id: string; api_key: string; bot_username: string | null; start_link: string | null };
-type ForwardJobRow = {
-  id: string;
-  bot_id: string;
-  source_chat_id: number;
-  source_message_id: number;
-  status: 'pending' | 'processing' | 'completed' | 'failed';
-  last_chat_id: number;
-  total_recipients: number;
-  processed_count: number;
-  success_count: number;
-  failed_count: number;
-};
+// (channel forward jobs removed — broadcasts are now sent immediately)
 type ChatRecord = {
   bot_id: string;
   chat_id: number;
