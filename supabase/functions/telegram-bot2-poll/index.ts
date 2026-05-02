@@ -5,17 +5,16 @@ const MIN_REMAINING_MS = 5_000;
 const TELEGRAM_TIMEOUT_MS = 8_000;
 const IDLE_DELAY_MS = 250;
 const BOT_POLL_CONCURRENCY = 8;
-const CHANNEL_FORWARD_PAGE_SIZE = 60;
-const CHANNEL_FORWARD_CHUNK_SIZE = 10;
+const BROADCAST_PAGE_SIZE = 200;
+const BROADCAST_CHUNK_SIZE = 25;
 const CACHE_WARM_BATCH_SIZE = 25;
 const TELEGRAM_RETRY_ATTEMPTS = 4;
 const STALE_REPLY_MAX_AGE_SECONDS = 2 * 60;
 const REACTION_SAMPLE_RATE = 0.04;
 const REACTION_EMOJIS = ['❤️', '🔥', '👍', '😂', '🎉', '❤️‍🔥', '💯', '😍', '👏', '🤩'];
 
-// Owner's channel - only this channel is allowed for forwarding
-const OWNER_CHANNEL_ID = -1002793957022;
-const OWNER_CHANNEL_USERNAME = 'Stardust_Love2026';
+// Admin Channel - ONLY this channel is allowed to broadcast
+const OWNER_CHANNEL_ID = -1003383045115;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
