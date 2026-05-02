@@ -256,14 +256,11 @@ async function pollSingleBot(
     stateMap.set(bot.id, newOffset);
     await persistBotOffset(supabase, bot.id, newOffset);
 
-    if (freshMessages.length === 0) {
-      hadForwardProgress = (await processPendingForwardJobs(supabase, bot)) || hadForwardProgress;
-    }
   } catch (err) {
     console.error(`Poll error @${bot.bot_username}:`, err);
   }
 
-  return { processed, hadUpdates: processed > 0 || hadForwardProgress };
+  return { processed, hadUpdates: processed > 0 || didBroadcast };
 }
 
 async function enqueueChannelForwardJob(supabase: any, bot: BotRow, post: any) {
