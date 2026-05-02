@@ -25,7 +25,7 @@ type ContentKind = 'text' | 'sticker' | 'voice' | 'text_rich';
 type ParsedContent = { kind: ContentKind; value: string; entities?: any[] };
 type BotRow = { id: string; api_key: string; bot_username: string | null; start_link: string | null };
 // (channel forward jobs removed — broadcasts are now sent immediately)
-type BroadcastClaim = { id: string };
+type BroadcastClaim = { id: string; status?: string };
 type RecipientClaim = { id: string; target_chat_id: number };
 type ChatRecord = {
   bot_id: string;
@@ -373,14 +373,26 @@ async function claimBroadcastOnce(
       source_message_id: sourceMessageId,
       status: 'processing',
     })
-    .select('id')
+    .select('id, status')
     .single();
 
   if (!error && data?.id) return data;
 
   if (error?.code === '23505' || /duplicate key|bot_broadcast_deliveries/i.test(String(error?.message || ''))) {
-    console.log(`@${bot.bot_username}: skipped duplicate broadcast post ${sourceMessageId}`);
-    return null;
+    const { data: existing } = await supabase
+      .from('bot_broadcast_deliveries')
+      .select('id, status')
+      .eq('bot_id', bot.id)
+      .eq('source_chat_id', sourceChatId)
+      .eq('source_message_id', sourceMessageId)
+      .maybeSingle();
+
+    if (existing?.status === 'completed') {
+      console.log(`@${bot.bot_username}: skipped completed broadcast post ${sourceMessageId}`);
+      return null;
+    }
+
+    return existing?.id ? existing : null;
   }
 
   console.error(`@${bot.bot_username}: broadcast claim failed`, error);
