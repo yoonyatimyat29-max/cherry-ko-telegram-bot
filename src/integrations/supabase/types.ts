@@ -191,65 +191,6 @@ export type Database = {
         }
         Relationships: []
       }
-      channel_forward_jobs: {
-        Row: {
-          bot_id: string
-          completed_at: string | null
-          created_at: string
-          failed_count: number
-          id: string
-          last_chat_id: number
-          last_error: string | null
-          processed_count: number
-          source_chat_id: number
-          source_message_id: number
-          status: string
-          success_count: number
-          total_recipients: number
-          updated_at: string
-        }
-        Insert: {
-          bot_id: string
-          completed_at?: string | null
-          created_at?: string
-          failed_count?: number
-          id?: string
-          last_chat_id?: number
-          last_error?: string | null
-          processed_count?: number
-          source_chat_id: number
-          source_message_id: number
-          status?: string
-          success_count?: number
-          total_recipients?: number
-          updated_at?: string
-        }
-        Update: {
-          bot_id?: string
-          completed_at?: string | null
-          created_at?: string
-          failed_count?: number
-          id?: string
-          last_chat_id?: number
-          last_error?: string | null
-          processed_count?: number
-          source_chat_id?: number
-          source_message_id?: number
-          status?: string
-          success_count?: number
-          total_recipients?: number
-          updated_at?: string
-        }
-        Relationships: [
-          {
-            foreignKeyName: "channel_forward_jobs_bot_id_fkey"
-            columns: ["bot_id"]
-            isOneToOne: false
-            referencedRelation: "bots"
-            referencedColumns: ["id"]
-          },
-        ]
-      }
       trigger_pointers: {
         Row: {
           bot_id: string

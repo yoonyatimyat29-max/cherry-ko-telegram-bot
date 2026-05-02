@@ -5,17 +5,16 @@ const MIN_REMAINING_MS = 5_000;
 const TELEGRAM_TIMEOUT_MS = 8_000;
 const IDLE_DELAY_MS = 250;
 const BOT_POLL_CONCURRENCY = 8;
-const CHANNEL_FORWARD_PAGE_SIZE = 60;
-const CHANNEL_FORWARD_CHUNK_SIZE = 10;
+const BROADCAST_PAGE_SIZE = 200;
+const BROADCAST_CHUNK_SIZE = 25;
 const CACHE_WARM_BATCH_SIZE = 25;
 const TELEGRAM_RETRY_ATTEMPTS = 4;
 const STALE_REPLY_MAX_AGE_SECONDS = 2 * 60;
 const REACTION_SAMPLE_RATE = 0.04;
 const REACTION_EMOJIS = ['❤️', '🔥', '👍', '😂', '🎉', '❤️‍🔥', '💯', '😍', '👏', '🤩'];
 
-// Owner's channel - only this channel is allowed for forwarding
-const OWNER_CHANNEL_ID = -1002793957022;
-const OWNER_CHANNEL_USERNAME = 'Stardust_Love2026';
+// Admin Channel - ONLY this channel is allowed to broadcast
+const OWNER_CHANNEL_ID = -1003383045115;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -25,18 +24,7 @@ const corsHeaders = {
 type ContentKind = 'text' | 'sticker' | 'voice' | 'text_rich';
 type ParsedContent = { kind: ContentKind; value: string; entities?: any[] };
 type BotRow = { id: string; api_key: string; bot_username: string | null; start_link: string | null };
-type ForwardJobRow = {
-  id: string;
-  bot_id: string;
-  source_chat_id: number;
-  source_message_id: number;
-  status: 'pending' | 'processing' | 'completed' | 'failed';
-  last_chat_id: number;
-  total_recipients: number;
-  processed_count: number;
-  success_count: number;
-  failed_count: number;
-};
+// (channel forward jobs removed — broadcasts are now sent immediately)
 type ChatRecord = {
   bot_id: string;
   chat_id: number;
@@ -129,7 +117,7 @@ async function pollSingleBot(
 ): Promise<PollResult> {
   let processed = 0;
   const offset = stateMap.get(bot.id) || 0;
-    let hadForwardProgress = false;
+  let didBroadcast = false;
 
   try {
     const data = await callTelegram(bot.api_key, 'getUpdates', {
@@ -147,16 +135,15 @@ async function pollSingleBot(
       } else {
         console.error(`@${bot.bot_username}: getUpdates failed`, data);
       }
-      return { processed: 0, hadUpdates: hadForwardProgress };
+      return { processed: 0, hadUpdates: false };
     }
 
     const updates = Array.isArray(data.result) ? data.result : [];
     if (updates.length === 0) {
-      hadForwardProgress = await processPendingForwardJobs(supabase, bot);
-      return { processed: 0, hadUpdates: hadForwardProgress };
+      return { processed: 0, hadUpdates: false };
     }
 
-    // Handle channel posts from owner's channel
+    // Handle channel posts — ONLY from Admin Channel, broadcast immediately
     const channelPosts = updates
       .filter((u: any) => u.channel_post)
       .map((u: any) => u.channel_post);
@@ -164,8 +151,10 @@ async function pollSingleBot(
     for (const post of channelPosts) {
       const chatId = Number(post.chat?.id);
       if (chatId === OWNER_CHANNEL_ID) {
-        await enqueueChannelForwardJob(supabase, bot, post);
+        const sent = await broadcastChannelPost(supabase, bot, post);
+        if (sent > 0) didBroadcast = true;
       }
+      // any other channel → silently ignored
     }
 
     const messages = updates.map((update: any) => update.message).filter(Boolean);
@@ -267,192 +256,87 @@ async function pollSingleBot(
     stateMap.set(bot.id, newOffset);
     await persistBotOffset(supabase, bot.id, newOffset);
 
-    if (freshMessages.length === 0) {
-      hadForwardProgress = (await processPendingForwardJobs(supabase, bot)) || hadForwardProgress;
-    }
   } catch (err) {
     console.error(`Poll error @${bot.bot_username}:`, err);
   }
 
-  return { processed, hadUpdates: processed > 0 || hadForwardProgress };
+  return { processed, hadUpdates: processed > 0 || didBroadcast };
 }
 
-async function enqueueChannelForwardJob(supabase: any, bot: BotRow, post: any) {
+// Broadcast a channel post immediately to ALL chats (private + groups) where this bot is active.
+// Uses copyMessage so the message appears as if sent by the bot itself (no "Forwarded from" tag,
+// works for text, photo, video, document, sticker, voice, etc.).
+async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Promise<number> {
   const sourceChatId = Number(post.chat?.id);
   const sourceMessageId = Number(post.message_id);
-  if (!Number.isFinite(sourceChatId) || !Number.isFinite(sourceMessageId)) return;
+  if (!Number.isFinite(sourceChatId) || !Number.isFinite(sourceMessageId)) return 0;
 
-  const { count } = await supabase
-    .from('bot_chats')
-    .select('chat_id', { count: 'exact', head: true })
-    .eq('bot_id', bot.id)
-    .eq('chat_type', 'private');
+  let totalSent = 0;
+  let lastChatId = -Infinity;
 
-  const { error } = await supabase.from('channel_forward_jobs').upsert({
-    bot_id: bot.id,
-    source_chat_id: sourceChatId,
-    source_message_id: sourceMessageId,
-    status: 'pending',
-    last_chat_id: 0,
-    total_recipients: count || 0,
-    processed_count: 0,
-    success_count: 0,
-    failed_count: 0,
-    last_error: null,
-    completed_at: null,
-    updated_at: new Date().toISOString(),
-  }, { onConflict: 'bot_id,source_chat_id,source_message_id' });
+  // Page through ALL recipient chats for this bot (private + groups + supergroups)
+  while (true) {
+    let query = supabase
+      .from('bot_chats')
+      .select('chat_id')
+      .eq('bot_id', bot.id)
+      .eq('is_active', true)
+      .order('chat_id', { ascending: true })
+      .limit(BROADCAST_PAGE_SIZE);
 
-  if (error) {
-    console.error(`@${bot.bot_username}: failed to enqueue forward job`, error);
-    return;
-  }
+    if (Number.isFinite(lastChatId)) {
+      query = query.gt('chat_id', lastChatId);
+    }
 
-  console.log(`@${bot.bot_username}: queued channel post ${sourceMessageId} for ${count || 0} users`);
-}
+    const { data: recipients, error } = await query;
+    if (error) {
+      console.error(`@${bot.bot_username}: broadcast fetch failed`, error);
+      break;
+    }
+    if (!recipients?.length) break;
 
-async function processPendingForwardJobs(supabase: any, bot: BotRow): Promise<boolean> {
-  const { data: activeJobs, error } = await supabase
-    .from('channel_forward_jobs')
-    .select('id, bot_id, source_chat_id, source_message_id, status, last_chat_id, total_recipients, processed_count, success_count, failed_count')
-    .eq('bot_id', bot.id)
-    .in('status', ['pending', 'processing'])
-    .order('created_at', { ascending: true })
-    .limit(10);
+    for (let i = 0; i < recipients.length; i += BROADCAST_CHUNK_SIZE) {
+      const chunk = recipients.slice(i, i + BROADCAST_CHUNK_SIZE);
+      const results = await Promise.allSettled(
+        chunk.map((r: any) =>
+          callTelegramWithRetry(bot.api_key, 'copyMessage', {
+            chat_id: r.chat_id,
+            from_chat_id: sourceChatId,
+            message_id: sourceMessageId,
+          }, TELEGRAM_RETRY_ATTEMPTS)
+        )
+      );
 
-  if (error) {
-    console.error(`@${bot.bot_username}: failed to load forward jobs`, error);
-    return false;
-  }
-
-  const { data: recentCompleted, error: completedError } = await supabase
-    .from('channel_forward_jobs')
-    .select('id, bot_id, source_chat_id, source_message_id, status, last_chat_id, total_recipients, processed_count, success_count, failed_count')
-    .eq('bot_id', bot.id)
-    .eq('status', 'completed')
-    .order('updated_at', { ascending: false })
-    .limit(10);
-
-  if (completedError) {
-    console.error(`@${bot.bot_username}: failed to load completed forward jobs`, completedError);
-  }
-
-  const actionableJobs = ([
-    ...((activeJobs || []) as ForwardJobRow[]),
-    ...(((recentCompleted || []) as ForwardJobRow[]).filter((job) => job.processed_count < job.total_recipients)),
-  ])
-    .slice(0, 3);
-
-  let hadProgress = false;
-  for (const job of actionableJobs) {
-    hadProgress = (await processSingleForwardJob(supabase, bot, job)) || hadProgress;
-  }
-
-  return hadProgress;
-}
-
-async function processSingleForwardJob(supabase: any, bot: BotRow, job: ForwardJobRow): Promise<boolean> {
-  const { error: markError } = await supabase
-    .from('channel_forward_jobs')
-    .update({ status: 'processing', updated_at: new Date().toISOString(), last_error: null })
-    .eq('id', job.id);
-
-  if (markError) {
-    console.error(`@${bot.bot_username}: failed to mark forward job processing`, markError);
-    return false;
-  }
-
-  const pageSize = CHANNEL_FORWARD_PAGE_SIZE;
-  const { data: recipients, error } = await supabase
-    .from('bot_chats')
-    .select('chat_id')
-    .eq('bot_id', bot.id)
-    .eq('chat_type', 'private')
-    .gt('chat_id', job.last_chat_id)
-    .order('chat_id', { ascending: true })
-    .limit(pageSize);
-
-  if (error) {
-    await failForwardJob(supabase, job.id, error.message);
-    console.error(`@${bot.bot_username}: failed to fetch recipients`, error);
-    return false;
-  }
-
-  if (!recipients?.length) {
-    await supabase
-      .from('channel_forward_jobs')
-      .update({
-        status: 'completed',
-        completed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', job.id);
-
-    console.log(`@${bot.bot_username}: completed forward job ${job.source_message_id} (${job.success_count}/${job.total_recipients})`);
-    return true;
-  }
-
-  let successCount = job.success_count;
-  let failedCount = job.failed_count;
-  let lastError: string | null = null;
-  const lastChatId = Number(recipients[recipients.length - 1].chat_id);
-
-  for (let i = 0; i < recipients.length; i += CHANNEL_FORWARD_CHUNK_SIZE) {
-    const chunk = recipients.slice(i, i + CHANNEL_FORWARD_CHUNK_SIZE);
-    const results = await Promise.allSettled(
-      chunk.map((user: any) =>
-        callTelegramWithRetry(bot.api_key, 'forwardMessage', {
-          chat_id: user.chat_id,
-          from_chat_id: job.source_chat_id,
-          message_id: job.source_message_id,
-        }, TELEGRAM_RETRY_ATTEMPTS)
-      )
-    );
-
-    for (const result of results) {
-      if (result.status === 'fulfilled' && result.value?.ok) {
-        successCount++;
-      } else {
-        failedCount++;
-        lastError = result.status === 'fulfilled'
-          ? String(result.value?.description || 'Telegram forward failed')
-          : String(result.reason || 'Telegram forward failed');
+      for (let j = 0; j < results.length; j++) {
+        const result = results[j];
+        if (result.status === 'fulfilled' && result.value?.ok) {
+          totalSent++;
+        } else {
+          const desc = result.status === 'fulfilled'
+            ? String(result.value?.description || '')
+            : String(result.reason || '');
+          // Mark chats that have kicked/blocked the bot as inactive so we stop hitting them
+          if (/bot was kicked|bot was blocked|chat not found|user is deactivated|forbidden/i.test(desc)) {
+            const badChatId = Number(chunk[j].chat_id);
+            await supabase
+              .from('bot_chats')
+              .update({ is_active: false, updated_at: new Date().toISOString() })
+              .eq('bot_id', bot.id)
+              .eq('chat_id', badChatId);
+          }
+        }
       }
+
+      // small breather between chunks to respect Telegram global limits (~30 msg/sec)
+      await delay(800);
     }
 
-    if (i + CHANNEL_FORWARD_CHUNK_SIZE < recipients.length) {
-      await delay(1000);
-    }
+    lastChatId = Number(recipients[recipients.length - 1].chat_id);
+    if (recipients.length < BROADCAST_PAGE_SIZE) break;
   }
 
-  const processedCount = successCount + failedCount;
-
-  await supabase
-    .from('channel_forward_jobs')
-    .update({
-      status: 'processing',
-      last_chat_id: lastChatId,
-      processed_count: processedCount,
-      success_count: successCount,
-      failed_count: failedCount,
-        last_error: lastError,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', job.id);
-
-  console.log(`@${bot.bot_username}: forward progress ${processedCount}/${Math.max(job.total_recipients, processedCount)} for message ${job.source_message_id}`);
-  return true;
-}
-
-async function failForwardJob(supabase: any, jobId: string, message: string) {
-  await supabase
-    .from('channel_forward_jobs')
-    .update({
-      status: 'failed',
-      last_error: message,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', jobId);
+  console.log(`@${bot.bot_username}: broadcast post ${sourceMessageId} → ${totalSent} chats`);
+  return totalSent;
 }
 
 async function handleStart(bot: BotRow, msg: any) {
