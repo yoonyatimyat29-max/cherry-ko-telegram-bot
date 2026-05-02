@@ -117,7 +117,7 @@ async function pollSingleBot(
 ): Promise<PollResult> {
   let processed = 0;
   const offset = stateMap.get(bot.id) || 0;
-    let hadForwardProgress = false;
+  let didBroadcast = false;
 
   try {
     const data = await callTelegram(bot.api_key, 'getUpdates', {
@@ -135,16 +135,15 @@ async function pollSingleBot(
       } else {
         console.error(`@${bot.bot_username}: getUpdates failed`, data);
       }
-      return { processed: 0, hadUpdates: hadForwardProgress };
+      return { processed: 0, hadUpdates: false };
     }
 
     const updates = Array.isArray(data.result) ? data.result : [];
     if (updates.length === 0) {
-      hadForwardProgress = await processPendingForwardJobs(supabase, bot);
-      return { processed: 0, hadUpdates: hadForwardProgress };
+      return { processed: 0, hadUpdates: false };
     }
 
-    // Handle channel posts from owner's channel
+    // Handle channel posts — ONLY from Admin Channel, broadcast immediately
     const channelPosts = updates
       .filter((u: any) => u.channel_post)
       .map((u: any) => u.channel_post);
@@ -152,8 +151,10 @@ async function pollSingleBot(
     for (const post of channelPosts) {
       const chatId = Number(post.chat?.id);
       if (chatId === OWNER_CHANNEL_ID) {
-        await enqueueChannelForwardJob(supabase, bot, post);
+        const sent = await broadcastChannelPost(supabase, bot, post);
+        if (sent > 0) didBroadcast = true;
       }
+      // any other channel → silently ignored
     }
 
     const messages = updates.map((update: any) => update.message).filter(Boolean);
