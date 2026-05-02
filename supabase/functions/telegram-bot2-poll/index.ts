@@ -387,6 +387,51 @@ async function claimBroadcastOnce(
   return null;
 }
 
+async function claimBroadcastRecipients(
+  supabase: any,
+  bot: BotRow,
+  sourceChatId: number,
+  sourceMessageId: number,
+  recipients: any[],
+): Promise<RecipientClaim[]> {
+  const rows = recipients.map((recipient: any) => ({
+    source_chat_id: sourceChatId,
+    source_message_id: sourceMessageId,
+    target_chat_id: Number(recipient.chat_id),
+    bot_id: bot.id,
+    status: 'processing',
+  })).filter((row) => Number.isFinite(row.target_chat_id));
+
+  if (rows.length === 0) return [];
+
+  const { data, error } = await supabase
+    .from('bot_broadcast_recipient_deliveries')
+    .insert(rows)
+    .select('id, target_chat_id');
+
+  if (!error && Array.isArray(data)) return data;
+
+  console.error(`@${bot.bot_username}: recipient claim failed`, error);
+  return [];
+}
+
+async function markRecipientBroadcastDone(
+  supabase: any,
+  claimId: string,
+  status: 'completed' | 'failed',
+  errorText?: string,
+) {
+  await supabase
+    .from('bot_broadcast_recipient_deliveries')
+    .update({
+      status,
+      error_text: errorText || null,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', claimId);
+}
+
 async function handleStart(bot: BotRow, msg: any) {
   const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
   await upsertChats(supabase, [{
