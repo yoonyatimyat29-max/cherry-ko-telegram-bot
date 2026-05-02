@@ -406,7 +406,10 @@ async function claimBroadcastRecipients(
 
   const { data, error } = await supabase
     .from('bot_broadcast_recipient_deliveries')
-    .insert(rows)
+    .upsert(rows, {
+      onConflict: 'source_chat_id,source_message_id,target_chat_id',
+      ignoreDuplicates: true,
+    })
     .select('id, target_chat_id');
 
   if (!error && Array.isArray(data)) return data;
