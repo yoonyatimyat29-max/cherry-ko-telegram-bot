@@ -25,6 +25,8 @@ type ContentKind = 'text' | 'sticker' | 'voice' | 'text_rich';
 type ParsedContent = { kind: ContentKind; value: string; entities?: any[] };
 type BotRow = { id: string; api_key: string; bot_username: string | null; start_link: string | null };
 // (channel forward jobs removed — broadcasts are now sent immediately)
+type BroadcastClaim = { id: string; status?: string };
+type RecipientClaim = { id: string; target_chat_id: number };
 type ChatRecord = {
   bot_id: string;
   chat_id: number;
@@ -271,6 +273,9 @@ async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Prom
   const sourceMessageId = Number(post.message_id);
   if (!Number.isFinite(sourceChatId) || !Number.isFinite(sourceMessageId)) return 0;
 
+  const claim = await claimBroadcastOnce(supabase, bot, sourceChatId, sourceMessageId);
+  if (!claim) return 0;
+
   let totalSent = 0;
   let lastChatId = -Infinity;
 
@@ -297,10 +302,13 @@ async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Prom
 
     for (let i = 0; i < recipients.length; i += BROADCAST_CHUNK_SIZE) {
       const chunk = recipients.slice(i, i + BROADCAST_CHUNK_SIZE);
+      const claimedRecipients = await claimBroadcastRecipients(supabase, bot, sourceChatId, sourceMessageId, chunk);
+      if (claimedRecipients.length === 0) continue;
+
       const results = await Promise.allSettled(
-        chunk.map((r: any) =>
+        claimedRecipients.map((r: RecipientClaim) =>
           callTelegramWithRetry(bot.api_key, 'copyMessage', {
-            chat_id: r.chat_id,
+            chat_id: r.target_chat_id,
             from_chat_id: sourceChatId,
             message_id: sourceMessageId,
           }, TELEGRAM_RETRY_ATTEMPTS)
@@ -311,13 +319,15 @@ async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Prom
         const result = results[j];
         if (result.status === 'fulfilled' && result.value?.ok) {
           totalSent++;
+          await markRecipientBroadcastDone(supabase, claimedRecipients[j].id, 'completed');
         } else {
           const desc = result.status === 'fulfilled'
             ? String(result.value?.description || '')
             : String(result.reason || '');
+          await markRecipientBroadcastDone(supabase, claimedRecipients[j].id, 'failed', desc.slice(0, 500));
           // Mark chats that have kicked/blocked the bot as inactive so we stop hitting them
           if (/bot was kicked|bot was blocked|chat not found|user is deactivated|forbidden/i.test(desc)) {
-            const badChatId = Number(chunk[j].chat_id);
+            const badChatId = Number(claimedRecipients[j].target_chat_id);
             await supabase
               .from('bot_chats')
               .update({ is_active: false, updated_at: new Date().toISOString() })
@@ -335,8 +345,106 @@ async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Prom
     if (recipients.length < BROADCAST_PAGE_SIZE) break;
   }
 
+  await supabase
+    .from('bot_broadcast_deliveries')
+    .update({
+      status: 'completed',
+      delivered_count: totalSent,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', claim.id);
+
   console.log(`@${bot.bot_username}: broadcast post ${sourceMessageId} → ${totalSent} chats`);
   return totalSent;
+}
+
+async function claimBroadcastOnce(
+  supabase: any,
+  bot: BotRow,
+  sourceChatId: number,
+  sourceMessageId: number,
+): Promise<BroadcastClaim | null> {
+  const { data, error } = await supabase
+    .from('bot_broadcast_deliveries')
+    .insert({
+      bot_id: bot.id,
+      source_chat_id: sourceChatId,
+      source_message_id: sourceMessageId,
+      status: 'processing',
+    })
+    .select('id, status')
+    .single();
+
+  if (!error && data?.id) return data;
+
+  if (error?.code === '23505' || /duplicate key|bot_broadcast_deliveries/i.test(String(error?.message || ''))) {
+    const { data: existing } = await supabase
+      .from('bot_broadcast_deliveries')
+      .select('id, status')
+      .eq('bot_id', bot.id)
+      .eq('source_chat_id', sourceChatId)
+      .eq('source_message_id', sourceMessageId)
+      .maybeSingle();
+
+    if (existing?.status === 'completed') {
+      console.log(`@${bot.bot_username}: skipped completed broadcast post ${sourceMessageId}`);
+      return null;
+    }
+
+    return existing?.id ? existing : null;
+  }
+
+  console.error(`@${bot.bot_username}: broadcast claim failed`, error);
+  return null;
+}
+
+async function claimBroadcastRecipients(
+  supabase: any,
+  bot: BotRow,
+  sourceChatId: number,
+  sourceMessageId: number,
+  recipients: any[],
+): Promise<RecipientClaim[]> {
+  const rows = recipients.map((recipient: any) => ({
+    source_chat_id: sourceChatId,
+    source_message_id: sourceMessageId,
+    target_chat_id: Number(recipient.chat_id),
+    bot_id: bot.id,
+    status: 'processing',
+  })).filter((row) => Number.isFinite(row.target_chat_id));
+
+  if (rows.length === 0) return [];
+
+  const { data, error } = await supabase
+    .from('bot_broadcast_recipient_deliveries')
+    .upsert(rows, {
+      onConflict: 'source_chat_id,source_message_id,target_chat_id',
+      ignoreDuplicates: true,
+    })
+    .select('id, target_chat_id');
+
+  if (!error && Array.isArray(data)) return data;
+
+  console.error(`@${bot.bot_username}: recipient claim failed`, error);
+  return [];
+}
+
+async function markRecipientBroadcastDone(
+  supabase: any,
+  claimId: string,
+  status: 'completed' | 'failed',
+  errorText?: string,
+) {
+  await supabase
+    .from('bot_broadcast_recipient_deliveries')
+    .update({
+      status,
+      error_text: errorText || null,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', claimId);
 }
 
 async function handleStart(bot: BotRow, msg: any) {
