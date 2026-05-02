@@ -14,6 +14,42 @@ export type Database = {
   }
   public: {
     Tables: {
+      bot_broadcast_deliveries: {
+        Row: {
+          bot_id: string
+          completed_at: string | null
+          delivered_count: number
+          id: string
+          source_chat_id: number
+          source_message_id: number
+          started_at: string
+          status: string
+          updated_at: string
+        }
+        Insert: {
+          bot_id: string
+          completed_at?: string | null
+          delivered_count?: number
+          id?: string
+          source_chat_id: number
+          source_message_id: number
+          started_at?: string
+          status?: string
+          updated_at?: string
+        }
+        Update: {
+          bot_id?: string
+          completed_at?: string | null
+          delivered_count?: number
+          id?: string
+          source_chat_id?: number
+          source_message_id?: number
+          started_at?: string
+          status?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
       bot_chats: {
         Row: {
           bot_id: string
