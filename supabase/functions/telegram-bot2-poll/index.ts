@@ -26,6 +26,7 @@ type ParsedContent = { kind: ContentKind; value: string; entities?: any[] };
 type BotRow = { id: string; api_key: string; bot_username: string | null; start_link: string | null };
 // (channel forward jobs removed — broadcasts are now sent immediately)
 type BroadcastClaim = { id: string };
+type RecipientClaim = { id: string; target_chat_id: number };
 type ChatRecord = {
   bot_id: string;
   chat_id: number;
@@ -301,10 +302,13 @@ async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Prom
 
     for (let i = 0; i < recipients.length; i += BROADCAST_CHUNK_SIZE) {
       const chunk = recipients.slice(i, i + BROADCAST_CHUNK_SIZE);
+      const claimedRecipients = await claimBroadcastRecipients(supabase, bot, sourceChatId, sourceMessageId, chunk);
+      if (claimedRecipients.length === 0) continue;
+
       const results = await Promise.allSettled(
-        chunk.map((r: any) =>
+        claimedRecipients.map((r: RecipientClaim) =>
           callTelegramWithRetry(bot.api_key, 'copyMessage', {
-            chat_id: r.chat_id,
+            chat_id: r.target_chat_id,
             from_chat_id: sourceChatId,
             message_id: sourceMessageId,
           }, TELEGRAM_RETRY_ATTEMPTS)
@@ -315,13 +319,15 @@ async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Prom
         const result = results[j];
         if (result.status === 'fulfilled' && result.value?.ok) {
           totalSent++;
+          await markRecipientBroadcastDone(supabase, claimedRecipients[j].id, 'completed');
         } else {
           const desc = result.status === 'fulfilled'
             ? String(result.value?.description || '')
             : String(result.reason || '');
+          await markRecipientBroadcastDone(supabase, claimedRecipients[j].id, 'failed', desc.slice(0, 500));
           // Mark chats that have kicked/blocked the bot as inactive so we stop hitting them
           if (/bot was kicked|bot was blocked|chat not found|user is deactivated|forbidden/i.test(desc)) {
-            const badChatId = Number(chunk[j].chat_id);
+            const badChatId = Number(claimedRecipients[j].target_chat_id);
             await supabase
               .from('bot_chats')
               .update({ is_active: false, updated_at: new Date().toISOString() })
