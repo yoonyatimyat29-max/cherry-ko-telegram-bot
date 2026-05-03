@@ -3,14 +3,29 @@ import { supabase } from "@/integrations/supabase/client";
 import { Bot, MessageSquare, Users, Zap, ArrowRight } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
+const withTimeout = async <T,>(promise: PromiseLike<T>, fallback: T, timeoutMs = 5_000) => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<T>((resolve) => {
+      timer = setTimeout(() => resolve(fallback), timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+};
+
 const Index = () => {
   const { data: bots, isLoading: botsLoading, isError: botsError } = useQuery({
     queryKey: ["bots-count"],
     queryFn: async () => {
-      const { count, error } = await supabase
-        .from("bots" as any)
-        .select("*", { count: "exact", head: true })
-        .eq("is_active", true);
+      const { count, error } = await withTimeout(
+        supabase
+          .from("bots" as any)
+          .select("*", { count: "exact", head: true })
+          .eq("is_active", true),
+        { count: 0, error: null } as any,
+      );
 
       if (error) throw error;
       return count || 0;
@@ -21,11 +36,15 @@ const Index = () => {
   const { data: pairsCount } = useQuery({
     queryKey: ["pairs-count"],
     queryFn: async () => {
-      const { count } = await supabase
-        .from("trigger_responses" as any)
-        .select("*", { count: "exact", head: true });
+      const { count } = await withTimeout(
+        supabase
+          .from("trigger_responses" as any)
+          .select("*", { count: "exact", head: true }),
+        { count: 0 } as any,
+      );
       return count || 0;
     },
+    retry: 1,
   });
 
   return (

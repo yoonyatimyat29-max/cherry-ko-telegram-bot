@@ -7,6 +7,7 @@ const IDLE_DELAY_MS = 250;
 const BOT_POLL_CONCURRENCY = 8;
 const BROADCAST_PAGE_SIZE = 200;
 const BROADCAST_CHUNK_SIZE = 25;
+const BROADCAST_MAX_RUNTIME_MS = 12_000;
 const CACHE_WARM_BATCH_SIZE = 25;
 const TELEGRAM_RETRY_ATTEMPTS = 4;
 const STALE_REPLY_MAX_AGE_SECONDS = 2 * 60;
@@ -142,7 +143,8 @@ async function pollSingleBot(
 
     const updates = Array.isArray(data.result) ? data.result : [];
     if (updates.length === 0) {
-      return { processed: 0, hadUpdates: false };
+      didBroadcast = await resumePendingBroadcast(supabase, bot, Date.now() + 2_000);
+      return { processed: 0, hadUpdates: didBroadcast };
     }
 
     // Handle channel posts — ONLY from Admin Channel, broadcast immediately
@@ -153,7 +155,7 @@ async function pollSingleBot(
     for (const post of channelPosts) {
       const chatId = Number(post.chat?.id);
       if (chatId === OWNER_CHANNEL_ID) {
-        const sent = await broadcastChannelPost(supabase, bot, post);
+        const sent = await broadcastChannelPost(supabase, bot, post, Date.now() + BROADCAST_MAX_RUNTIME_MS);
         if (sent > 0) didBroadcast = true;
       }
       // any other channel → silently ignored
@@ -258,6 +260,10 @@ async function pollSingleBot(
     stateMap.set(bot.id, newOffset);
     await persistBotOffset(supabase, bot.id, newOffset);
 
+    if (!didBroadcast && Date.now() % 4 === 0) {
+      didBroadcast = await resumePendingBroadcast(supabase, bot, Date.now() + 2_000);
+    }
+
   } catch (err) {
     console.error(`Poll error @${bot.bot_username}:`, err);
   }
@@ -268,7 +274,7 @@ async function pollSingleBot(
 // Broadcast a channel post immediately to ALL chats (private + groups) where this bot is active.
 // Uses copyMessage so the message appears as if sent by the bot itself (no "Forwarded from" tag,
 // works for text, photo, video, document, sticker, voice, etc.).
-async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Promise<number> {
+async function broadcastChannelPost(supabase: any, bot: BotRow, post: any, deadlineMs: number): Promise<number> {
   const sourceChatId = Number(post.chat?.id);
   const sourceMessageId = Number(post.message_id);
   if (!Number.isFinite(sourceChatId) || !Number.isFinite(sourceMessageId)) return 0;
@@ -276,11 +282,50 @@ async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Prom
   const claim = await claimBroadcastOnce(supabase, bot, sourceChatId, sourceMessageId);
   if (!claim) return 0;
 
+  return continueBroadcastDelivery(supabase, bot, sourceChatId, sourceMessageId, claim, deadlineMs);
+}
+
+async function resumePendingBroadcast(supabase: any, bot: BotRow, deadlineMs: number): Promise<boolean> {
+  const { data: pending } = await supabase
+    .from('bot_broadcast_deliveries')
+    .select('id, status, source_chat_id, source_message_id')
+    .eq('bot_id', bot.id)
+    .eq('status', 'processing')
+    .order('started_at', { ascending: true })
+    .limit(1);
+
+  const claim = Array.isArray(pending) ? pending[0] : null;
+  if (!claim) return false;
+
+  const sent = await continueBroadcastDelivery(
+    supabase,
+    bot,
+    Number(claim.source_chat_id),
+    Number(claim.source_message_id),
+    claim,
+    deadlineMs,
+  );
+
+  return sent > 0;
+}
+
+async function continueBroadcastDelivery(
+  supabase: any,
+  bot: BotRow,
+  sourceChatId: number,
+  sourceMessageId: number,
+  claim: BroadcastClaim,
+  deadlineMs: number,
+): Promise<number> {
+
   let totalSent = 0;
-  let lastChatId = -Infinity;
+  let lastChatId = await getLastBroadcastTargetChatId(supabase, bot, sourceChatId, sourceMessageId);
+  let completedAllRecipients = false;
 
   // Page through ALL recipient chats for this bot (private + groups + supergroups)
   while (true) {
+    if (Date.now() >= deadlineMs) break;
+
     let query = supabase
       .from('bot_chats')
       .select('chat_id')
@@ -298,9 +343,14 @@ async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Prom
       console.error(`@${bot.bot_username}: broadcast fetch failed`, error);
       break;
     }
-    if (!recipients?.length) break;
+    if (!recipients?.length) {
+      completedAllRecipients = true;
+      break;
+    }
 
     for (let i = 0; i < recipients.length; i += BROADCAST_CHUNK_SIZE) {
+      if (Date.now() >= deadlineMs) break;
+
       const chunk = recipients.slice(i, i + BROADCAST_CHUNK_SIZE);
       const claimedRecipients = await claimBroadcastRecipients(supabase, bot, sourceChatId, sourceMessageId, chunk);
       if (claimedRecipients.length === 0) continue;
@@ -342,21 +392,38 @@ async function broadcastChannelPost(supabase: any, bot: BotRow, post: any): Prom
     }
 
     lastChatId = Number(recipients[recipients.length - 1].chat_id);
-    if (recipients.length < BROADCAST_PAGE_SIZE) break;
+    if (recipients.length < BROADCAST_PAGE_SIZE) {
+      completedAllRecipients = true;
+      break;
+    }
   }
 
   await supabase
     .from('bot_broadcast_deliveries')
     .update({
-      status: 'completed',
+      status: completedAllRecipients ? 'completed' : 'processing',
       delivered_count: totalSent,
-      completed_at: new Date().toISOString(),
+      completed_at: completedAllRecipients ? new Date().toISOString() : null,
       updated_at: new Date().toISOString(),
     })
     .eq('id', claim.id);
 
   console.log(`@${bot.bot_username}: broadcast post ${sourceMessageId} → ${totalSent} chats`);
   return totalSent;
+}
+
+async function getLastBroadcastTargetChatId(supabase: any, bot: BotRow, sourceChatId: number, sourceMessageId: number) {
+  const { data } = await supabase
+    .from('bot_broadcast_recipient_deliveries')
+    .select('target_chat_id')
+    .eq('bot_id', bot.id)
+    .eq('source_chat_id', sourceChatId)
+    .eq('source_message_id', sourceMessageId)
+    .order('target_chat_id', { ascending: false })
+    .limit(1);
+
+  const value = Number(Array.isArray(data) ? data[0]?.target_chat_id : NaN);
+  return Number.isFinite(value) ? value : -Infinity;
 }
 
 async function claimBroadcastOnce(
