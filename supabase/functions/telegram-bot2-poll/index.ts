@@ -318,7 +318,7 @@ async function continueBroadcastDelivery(
 ): Promise<number> {
 
   let totalSent = 0;
-  let lastChatId = -Infinity;
+  let lastChatId = await getLastBroadcastTargetChatId(supabase, bot, sourceChatId, sourceMessageId);
   let completedAllRecipients = false;
 
   // Page through ALL recipient chats for this bot (private + groups + supergroups)
@@ -409,6 +409,20 @@ async function continueBroadcastDelivery(
 
   console.log(`@${bot.bot_username}: broadcast post ${sourceMessageId} → ${totalSent} chats`);
   return totalSent;
+}
+
+async function getLastBroadcastTargetChatId(supabase: any, bot: BotRow, sourceChatId: number, sourceMessageId: number) {
+  const { data } = await supabase
+    .from('bot_broadcast_recipient_deliveries')
+    .select('target_chat_id')
+    .eq('bot_id', bot.id)
+    .eq('source_chat_id', sourceChatId)
+    .eq('source_message_id', sourceMessageId)
+    .order('target_chat_id', { ascending: false })
+    .limit(1);
+
+  const value = Number(Array.isArray(data) ? data[0]?.target_chat_id : NaN);
+  return Number.isFinite(value) ? value : -Infinity;
 }
 
 async function claimBroadcastOnce(
