@@ -123,8 +123,6 @@ async function pollSingleBot(
   let didBroadcast = false;
 
   try {
-    didBroadcast = await resumePendingBroadcast(supabase, bot, Date.now() + Math.floor(BROADCAST_MAX_RUNTIME_MS / 2));
-
     const data = await callTelegram(bot.api_key, 'getUpdates', {
       offset,
       limit: 100,
@@ -260,6 +258,10 @@ async function pollSingleBot(
     const newOffset = Math.max(...updates.map((update: any) => update.update_id)) + 1;
     stateMap.set(bot.id, newOffset);
     await persistBotOffset(supabase, bot.id, newOffset);
+
+    if (!didBroadcast && Date.now() % 4 === 0) {
+      didBroadcast = await resumePendingBroadcast(supabase, bot, Date.now() + 2_000);
+    }
 
   } catch (err) {
     console.error(`Poll error @${bot.bot_username}:`, err);
