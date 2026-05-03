@@ -3,14 +3,16 @@ import { supabase } from "@/integrations/supabase/client";
 import { Bot, MessageSquare, Users, Zap, ArrowRight } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
-const withTimeout = async <T,>(promise: Promise<T>, fallback: T, timeoutMs = 5_000) => {
-  let timer: ReturnType<typeof setTimeout>;
+const withTimeout = async <T,>(promise: PromiseLike<T>, fallback: T, timeoutMs = 5_000) => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   return Promise.race([
     promise,
     new Promise<T>((resolve) => {
       timer = setTimeout(() => resolve(fallback), timeoutMs);
     }),
-  ]).finally(() => clearTimeout(timer));
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 };
 
 const Index = () => {
