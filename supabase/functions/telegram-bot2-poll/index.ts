@@ -144,7 +144,7 @@ async function pollSingleBot(
     const updates = Array.isArray(data.result) ? data.result : [];
     if (updates.length === 0) {
       didBroadcast = await resumePendingBroadcast(supabase, bot, Date.now() + 2_000);
-      return { processed: 0, hadUpdates: false };
+      return { processed: 0, hadUpdates: didBroadcast };
     }
 
     // Handle channel posts — ONLY from Admin Channel, broadcast immediately
