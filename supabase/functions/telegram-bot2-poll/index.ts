@@ -7,6 +7,7 @@ const IDLE_DELAY_MS = 250;
 const BOT_POLL_CONCURRENCY = 8;
 const BROADCAST_PAGE_SIZE = 200;
 const BROADCAST_CHUNK_SIZE = 25;
+const BROADCAST_MAX_RUNTIME_MS = 12_000;
 const CACHE_WARM_BATCH_SIZE = 25;
 const TELEGRAM_RETRY_ATTEMPTS = 4;
 const STALE_REPLY_MAX_AGE_SECONDS = 2 * 60;
@@ -153,7 +154,7 @@ async function pollSingleBot(
     for (const post of channelPosts) {
       const chatId = Number(post.chat?.id);
       if (chatId === OWNER_CHANNEL_ID) {
-        const sent = await broadcastChannelPost(supabase, bot, post);
+        const sent = await broadcastChannelPost(supabase, bot, post, Date.now() + BROADCAST_MAX_RUNTIME_MS);
         if (sent > 0) didBroadcast = true;
       }
       // any other channel → silently ignored
