@@ -1,10 +1,11 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 const GATEWAY_URL = 'https://connector-gateway.lovable.dev/telegram';
-const MAX_RUNTIME_MS = 25_000;
+const MAX_RUNTIME_MS = 45_000;
 const MIN_REMAINING_MS = 5_000;
-const TELEGRAM_GATEWAY_TIMEOUT_MS = 8_000;
+const TELEGRAM_GATEWAY_TIMEOUT_MS = 30_000;
 const BOT_TOKEN_REGEX = /^\d+:[A-Za-z0-9_-]{30,}$/;
+const START_COMMAND_REGEX = /^\/start(?:@\w+)?(?:\s|$)/i;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -47,16 +48,22 @@ Deno.serve(async (req) => {
     const remainingMs = MAX_RUNTIME_MS - elapsed;
     if (remainingMs < MIN_REMAINING_MS) break;
 
-    const timeout = Math.min(10, Math.floor(remainingMs / 1000) - 5);
+    const timeout = Math.min(20, Math.floor(remainingMs / 1000) - 5);
     if (timeout < 1) break;
 
     const data = await callGateway('getUpdates', {
       offset: currentOffset,
       timeout,
       allowed_updates: ['message', 'callback_query'],
-    }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+    }, LOVABLE_API_KEY, TELEGRAM_API_KEY, Math.max(TELEGRAM_GATEWAY_TIMEOUT_MS, (timeout + 5) * 1000));
 
     if (!data.ok) {
+      const description = String(data.description || '').toLowerCase();
+      if (String(data.error_code) === '409' && description.includes('webhook')) {
+        console.warn('Bot 1 webhook conflict detected; deleting webhook and retrying next run');
+        await callGateway('deleteWebhook', { drop_pending_updates: false }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+        break;
+      }
       if (String(data.error_code) === '409') {
         console.log('Bot 1 polling overlapped, skipping');
         break;
@@ -334,7 +341,7 @@ Deno.serve(async (req) => {
         const chatId = msg.chat.id;
         const text = (msg.text || '').trim();
 
-        if (text.toLowerCase() === '/start') {
+        if (START_COMMAND_REGEX.test(text)) {
           await callGateway('sendMessage', {
             chat_id: chatId,
             text: '🤖 မင်္ဂလာပါ! ဒီ Bot က စကားပြော Bot အသစ်များ ဖန်တီးပေးပါတယ်။',
