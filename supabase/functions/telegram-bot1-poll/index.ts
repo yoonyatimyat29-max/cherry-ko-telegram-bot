@@ -570,9 +570,15 @@ Deno.serve(async (req) => {
   });
 });
 
-async function callGateway(method: string, payload: Record<string, unknown>, LOVABLE_API_KEY: string, TELEGRAM_API_KEY: string) {
+async function callGateway(
+  method: string,
+  payload: Record<string, unknown>,
+  LOVABLE_API_KEY: string,
+  TELEGRAM_API_KEY: string,
+  timeoutMs = TELEGRAM_GATEWAY_TIMEOUT_MS,
+) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TELEGRAM_GATEWAY_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(`${GATEWAY_URL}/${method}`, {
