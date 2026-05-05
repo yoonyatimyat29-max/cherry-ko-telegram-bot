@@ -1,8 +1,9 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 const GATEWAY_URL = 'https://connector-gateway.lovable.dev/telegram';
-const MAX_RUNTIME_MS = 55_000;
+const MAX_RUNTIME_MS = 25_000;
 const MIN_REMAINING_MS = 5_000;
+const TELEGRAM_GATEWAY_TIMEOUT_MS = 8_000;
 const BOT_TOKEN_REGEX = /^\d+:[A-Za-z0-9_-]{30,}$/;
 
 const corsHeaders = {
@@ -46,7 +47,7 @@ Deno.serve(async (req) => {
     const remainingMs = MAX_RUNTIME_MS - elapsed;
     if (remainingMs < MIN_REMAINING_MS) break;
 
-    const timeout = Math.min(50, Math.floor(remainingMs / 1000) - 5);
+    const timeout = Math.min(10, Math.floor(remainingMs / 1000) - 5);
     if (timeout < 1) break;
 
     const data = await callGateway('getUpdates', {
@@ -333,7 +334,7 @@ Deno.serve(async (req) => {
         const chatId = msg.chat.id;
         const text = (msg.text || '').trim();
 
-        if (text === '/start') {
+        if (text.toLowerCase() === '/start') {
           await callGateway('sendMessage', {
             chat_id: chatId,
             text: '🤖 မင်္ဂလာပါ! ဒီ Bot က စကားပြော Bot အသစ်များ ဖန်တီးပေးပါတယ်။',
