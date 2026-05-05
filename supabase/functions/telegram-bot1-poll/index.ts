@@ -564,16 +564,26 @@ Deno.serve(async (req) => {
 });
 
 async function callGateway(method: string, payload: Record<string, unknown>, LOVABLE_API_KEY: string, TELEGRAM_API_KEY: string) {
-  const response = await fetch(`${GATEWAY_URL}/${method}`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${LOVABLE_API_KEY}`,
-      'X-Connection-Api-Key': TELEGRAM_API_KEY,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
-  return response.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TELEGRAM_GATEWAY_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${GATEWAY_URL}/${method}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${LOVABLE_API_KEY}`,
+        'X-Connection-Api-Key': TELEGRAM_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    return response.json();
+  } catch (err) {
+    return { ok: false, description: err instanceof Error ? err.message : String(err) };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function callTelegramDirect(botToken: string, method: string, payload: Record<string, unknown>) {
