@@ -1,9 +1,9 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 const GATEWAY_URL = 'https://connector-gateway.lovable.dev/telegram';
-const MAX_RUNTIME_MS = 45_000;
+const MAX_RUNTIME_MS = 20_000;
 const MIN_REMAINING_MS = 5_000;
-const TELEGRAM_GATEWAY_TIMEOUT_MS = 30_000;
+const TELEGRAM_GATEWAY_TIMEOUT_MS = 10_000;
 const BOT_TOKEN_REGEX = /^\d+:[A-Za-z0-9_-]{30,}$/;
 const START_COMMAND_REGEX = /^\/start(?:@\w+)?(?:\s|$)/i;
 
@@ -48,14 +48,14 @@ Deno.serve(async (req) => {
     const remainingMs = MAX_RUNTIME_MS - elapsed;
     if (remainingMs < MIN_REMAINING_MS) break;
 
-    const timeout = Math.min(20, Math.floor(remainingMs / 1000) - 5);
-    if (timeout < 1) break;
+    const timeout = 0;
 
     const data = await callGateway('getUpdates', {
       offset: currentOffset,
+      limit: 100,
       timeout,
       allowed_updates: ['message', 'callback_query'],
-    }, LOVABLE_API_KEY, TELEGRAM_API_KEY, Math.max(TELEGRAM_GATEWAY_TIMEOUT_MS, (timeout + 5) * 1000));
+    }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
 
     if (!data.ok) {
       const description = String(data.description || '').toLowerCase();
