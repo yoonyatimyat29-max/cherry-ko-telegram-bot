@@ -22,47 +22,68 @@ Deno.serve(async (req) => {
   const TELEGRAM_API_KEY = Deno.env.get('TELEGRAM_API_KEY');
   if (!TELEGRAM_API_KEY) throw new Error('TELEGRAM_API_KEY is not configured');
 
+  const requestBody = await readJsonBody(req);
+  const isWebhookUpdate = Number.isFinite(Number(requestBody?.update_id));
+  const shouldPoll = requestBody?.manual === true || requestBody?.poll === true;
+
+  if (isWebhookUpdate) {
+    const expectedSecret = await deriveTelegramWebhookSecret(TELEGRAM_API_KEY);
+    const actualSecret = req.headers.get('X-Telegram-Bot-Api-Secret-Token');
+    if (!safeEqual(actualSecret, expectedSecret)) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+    }
+  } else if (!shouldPoll) {
+    return new Response(JSON.stringify({ ok: true, mode: 'webhook', message: 'Bot A polling skipped' }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
   const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
   const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
   const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
   let totalProcessed = 0;
+  let updates: any[] = [];
 
-  const { data: state, error: stateErr } = await supabase
-    .from('bot1_state')
-    .select('update_offset')
-    .eq('id', 1)
-    .single();
+  if (isWebhookUpdate) {
+    updates = [requestBody];
+  } else {
+    const { data: state, error: stateErr } = await supabase
+      .from('bot1_state')
+      .select('update_offset')
+      .eq('id', 1)
+      .single();
 
-  if (stateErr) {
-    return new Response(JSON.stringify({ error: stateErr.message }), { status: 500, headers: corsHeaders });
+    if (stateErr) {
+      return new Response(JSON.stringify({ error: stateErr.message }), { status: 500, headers: corsHeaders });
+    }
+
+    const currentOffset = state.update_offset;
+
+    const data = await callGateway('getUpdates', {
+      offset: currentOffset,
+      limit: MAX_UPDATES_PER_RUN,
+      timeout: 0,
+      allowed_updates: ['message', 'callback_query'],
+    }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+
+    if (!data.ok) {
+      const description = String(data.description || '').toLowerCase();
+      if (String(data.error_code) === '409' && description.includes('webhook')) {
+        console.log('Bot 1 webhook is active; polling skipped');
+        return new Response(JSON.stringify({ ok: true, mode: 'webhook' }), { headers: corsHeaders });
+      }
+      if (String(data.error_code) === '409') {
+        console.log('Bot 1 polling overlapped, skipping');
+        return new Response(JSON.stringify({ ok: true, message: 'Polling overlap skipped' }), { headers: corsHeaders });
+      }
+      console.error('Telegram gateway error:', data);
+      return new Response(JSON.stringify({ error: data }), { status: 502, headers: corsHeaders });
+    }
+
+    updates = data.result ?? [];
   }
 
-  let currentOffset = state.update_offset;
-
-  const data = await callGateway('getUpdates', {
-    offset: currentOffset,
-    limit: MAX_UPDATES_PER_RUN,
-    timeout: 0,
-    allowed_updates: ['message', 'callback_query'],
-  }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
-
-  if (!data.ok) {
-    const description = String(data.description || '').toLowerCase();
-    if (String(data.error_code) === '409' && description.includes('webhook')) {
-      console.warn('Bot 1 webhook conflict detected; deleting webhook and retrying next run');
-      await callGateway('deleteWebhook', { drop_pending_updates: false }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
-      return new Response(JSON.stringify({ ok: true, message: 'Webhook conflict cleared' }), { headers: corsHeaders });
-    }
-    if (String(data.error_code) === '409') {
-      console.log('Bot 1 polling overlapped, skipping');
-      return new Response(JSON.stringify({ ok: true, message: 'Polling overlap skipped' }), { headers: corsHeaders });
-    }
-    console.error('Telegram gateway error:', data);
-    return new Response(JSON.stringify({ error: data }), { status: 502, headers: corsHeaders });
-  }
-
-  const updates = data.result ?? [];
   if (updates.length === 0) {
     return new Response(JSON.stringify({ ok: true, processed: 0 }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
