@@ -1,8 +1,7 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 const GATEWAY_URL = 'https://connector-gateway.lovable.dev/telegram';
-const MAX_RUNTIME_MS = 20_000;
-const MIN_REMAINING_MS = 5_000;
+const MAX_UPDATES_PER_RUN = 25;
 const TELEGRAM_GATEWAY_TIMEOUT_MS = 10_000;
 const BOT_TOKEN_REGEX = /^\d+:[A-Za-z0-9_-]{30,}$/;
 const START_COMMAND_REGEX = /^\/start(?:@\w+)?(?:\s|$)/i;
@@ -16,8 +15,6 @@ Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
-
-  const startTime = Date.now();
 
   const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
   if (!LOVABLE_API_KEY) throw new Error('LOVABLE_API_KEY is not configured');
@@ -43,39 +40,36 @@ Deno.serve(async (req) => {
 
   let currentOffset = state.update_offset;
 
-  while (true) {
-    const elapsed = Date.now() - startTime;
-    const remainingMs = MAX_RUNTIME_MS - elapsed;
-    if (remainingMs < MIN_REMAINING_MS) break;
+  const data = await callGateway('getUpdates', {
+    offset: currentOffset,
+    limit: MAX_UPDATES_PER_RUN,
+    timeout: 0,
+    allowed_updates: ['message', 'callback_query'],
+  }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
 
-    const timeout = 0;
-
-    const data = await callGateway('getUpdates', {
-      offset: currentOffset,
-      limit: 100,
-      timeout,
-      allowed_updates: ['message', 'callback_query'],
-    }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
-
-    if (!data.ok) {
-      const description = String(data.description || '').toLowerCase();
-      if (String(data.error_code) === '409' && description.includes('webhook')) {
-        console.warn('Bot 1 webhook conflict detected; deleting webhook and retrying next run');
-        await callGateway('deleteWebhook', { drop_pending_updates: false }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
-        break;
-      }
-      if (String(data.error_code) === '409') {
-        console.log('Bot 1 polling overlapped, skipping');
-        break;
-      }
-      console.error('Telegram gateway error:', data);
-      return new Response(JSON.stringify({ error: data }), { status: 502, headers: corsHeaders });
+  if (!data.ok) {
+    const description = String(data.description || '').toLowerCase();
+    if (String(data.error_code) === '409' && description.includes('webhook')) {
+      console.warn('Bot 1 webhook conflict detected; deleting webhook and retrying next run');
+      await callGateway('deleteWebhook', { drop_pending_updates: false }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
+      return new Response(JSON.stringify({ ok: true, message: 'Webhook conflict cleared' }), { headers: corsHeaders });
     }
+    if (String(data.error_code) === '409') {
+      console.log('Bot 1 polling overlapped, skipping');
+      return new Response(JSON.stringify({ ok: true, message: 'Polling overlap skipped' }), { headers: corsHeaders });
+    }
+    console.error('Telegram gateway error:', data);
+    return new Response(JSON.stringify({ error: data }), { status: 502, headers: corsHeaders });
+  }
 
-    const updates = data.result ?? [];
-    if (updates.length === 0) continue;
+  const updates = data.result ?? [];
+  if (updates.length === 0) {
+    return new Response(JSON.stringify({ ok: true, processed: 0 }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
 
-    for (const update of updates) {
+  for (const update of updates) {
       try {
         if (update.callback_query) {
           const cb = update.callback_query;
@@ -560,10 +554,9 @@ Deno.serve(async (req) => {
       }
     }
 
-    const newOffset = Math.max(...updates.map((u: any) => u.update_id)) + 1;
-    await supabase.from('bot1_state').update({ update_offset: newOffset, updated_at: new Date().toISOString() }).eq('id', 1);
-    currentOffset = newOffset;
-  }
+  const newOffset = Math.max(...updates.map((u: any) => u.update_id)) + 1;
+  await supabase.from('bot1_state').update({ update_offset: newOffset, updated_at: new Date().toISOString() }).eq('id', 1);
+  currentOffset = newOffset;
 
   return new Response(JSON.stringify({ ok: true, processed: totalProcessed }), {
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
