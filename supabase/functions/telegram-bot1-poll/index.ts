@@ -575,9 +575,10 @@ Deno.serve(async (req) => {
       }
     }
 
-  const newOffset = Math.max(...updates.map((u: any) => u.update_id)) + 1;
-  await supabase.from('bot1_state').update({ update_offset: newOffset, updated_at: new Date().toISOString() }).eq('id', 1);
-  currentOffset = newOffset;
+  if (!isWebhookUpdate) {
+    const newOffset = Math.max(...updates.map((u: any) => u.update_id)) + 1;
+    await supabase.from('bot1_state').update({ update_offset: newOffset, updated_at: new Date().toISOString() }).eq('id', 1);
+  }
 
   return new Response(JSON.stringify({ ok: true, processed: totalProcessed }), {
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -611,6 +612,32 @@ async function callGateway(
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function readJsonBody(req: Request) {
+  try {
+    return await req.json();
+  } catch {
+    return null;
+  }
+}
+
+async function deriveTelegramWebhookSecret(telegramApiKey: string): Promise<string> {
+  const data = new TextEncoder().encode(`telegram-webhook:${telegramApiKey}`);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function safeEqual(a: string | null, b: string): boolean {
+  if (!a || a.length !== b.length) return false;
+  let diff = 0;
+  for (let index = 0; index < a.length; index++) {
+    diff |= a.charCodeAt(index) ^ b.charCodeAt(index);
+  }
+  return diff === 0;
 }
 
 async function callTelegramDirect(botToken: string, method: string, payload: Record<string, unknown>) {
