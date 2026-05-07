@@ -3,6 +3,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 const GATEWAY_URL = 'https://connector-gateway.lovable.dev/telegram';
 const MAX_UPDATES_PER_RUN = 25;
 const TELEGRAM_GATEWAY_TIMEOUT_MS = 10_000;
+const TELEGRAM_DIRECT_TIMEOUT_MS = 6_000;
 const BOT_TOKEN_REGEX = /^\d+:[A-Za-z0-9_-]{30,}$/;
 const START_COMMAND_REGEX = /^\/start(?:@\w+)?(?:\s|$)/i;
 
@@ -274,13 +275,15 @@ Deno.serve(async (req) => {
             if (!bot || String(bot.owner_chat_id) !== String(cbChatId)) {
               await callGateway('sendMessage', { chat_id: cbChatId, text: '❌ ခွင့်မရှိပါ။' }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
             } else {
-              await callTelegramDirect(bot.api_key, 'deleteWebhook', { drop_pending_updates: false });
               await supabase.from('bots').update({ is_active: true }).eq('id', botId);
               await supabase.from('bot2_states').upsert({ bot_id: botId, update_offset: 0, updated_at: new Date().toISOString() }, { onConflict: 'bot_id' });
+              const webhookResult = await configureBot2Webhook(botId, bot.api_key);
 
               await callGateway('sendMessage', {
                 chat_id: cbChatId,
-                text: `✅ @${bot.bot_username} ကို ပြန် activate လုပ်ပြီးပါပြီ!`,
+                text: webhookResult.ok
+                  ? `✅ @${bot.bot_username} ကို ပြန် activate လုပ်ပြီးပါပြီ! 24နာရီ webhook ချိတ်ထားပြီးပါပြီ။`
+                  : `⚠️ @${bot.bot_username} ကို activate လုပ်ထားပါတယ်။ Telegram webhook ချိတ်ရာမှာ ခဏနှေးနေပါတယ်—နောက်ထပ် /start ပြန်စမ်းပါ။`,
                 reply_markup: { inline_keyboard: [[{ text: '🔙 Bot စီမံရန်', callback_data: `manage_bot:${botId}` }]] },
               }, LOVABLE_API_KEY, TELEGRAM_API_KEY);
             }
@@ -477,14 +480,12 @@ Deno.serve(async (req) => {
         const processingMsgId = processing.result?.message_id as number | undefined;
         const apiKey = text;
 
-        const validateData = await callTelegramDirect(apiKey, 'getMe', {});
+        const validateData = await callTelegramDirectWithRetry(apiKey, 'getMe', {}, 2);
         if (!validateData.ok) {
           await editOrSendMessage(chatId, processingMsgId, '❌ API Key မမှန်ပါ။ @BotFather ထံမှ မှန်ကန်သော API Key ကို ပေးပို့ပါ။', LOVABLE_API_KEY, TELEGRAM_API_KEY);
           totalProcessed++;
           continue;
         }
-
-        await callTelegramDirect(apiKey, 'deleteWebhook', { drop_pending_updates: false });
 
         const botInfo = validateData.result;
 
@@ -546,6 +547,14 @@ Deno.serve(async (req) => {
           update_offset: 0,
           updated_at: new Date().toISOString(),
         }, { onConflict: 'bot_id' });
+
+        const webhookResult = await configureBot2Webhook(targetBotId, apiKey);
+        if (!webhookResult.ok) {
+          console.error('Bot B webhook setup failed:', webhookResult);
+          await editOrSendMessage(chatId, processingMsgId, '⚠️ Bot သိမ်းပြီးပါပြီ၊ ဒါပေမယ့် Telegram 24နာရီ webhook ချိတ်ရာမှာ ခဏနှေးနေပါတယ်။ API Key ကို ထပ်မပို့ပါနဲ့—/start ပြန်နှိပ်ပြီး Bot များ ကြည့်ရန်မှာ စစ်ပါ။', LOVABLE_API_KEY, TELEGRAM_API_KEY);
+          totalProcessed++;
+          continue;
+        }
 
         await callTelegramDirect(apiKey, 'setMyCommands', {
           commands: [{ command: 'start', description: 'Bot ကို စတင်ပါ' }],
@@ -614,6 +623,29 @@ async function callGateway(
   }
 }
 
+async function configureBot2Webhook(botId: string, botToken: string) {
+  const supabaseUrl = Deno.env.get('SUPABASE_URL');
+  if (!supabaseUrl) return { ok: false, description: 'SUPABASE_URL is not configured' };
+
+  const secretToken = await deriveBot2WebhookSecret(botId, botToken);
+  return callTelegramDirectWithRetry(botToken, 'setWebhook', {
+    url: `${supabaseUrl}/functions/v1/telegram-bot2-poll?bot_id=${encodeURIComponent(botId)}`,
+    secret_token: secretToken,
+    allowed_updates: ['message', 'channel_post'],
+    drop_pending_updates: false,
+  }, 2);
+}
+
+async function callTelegramDirectWithRetry(botToken: string, method: string, payload: Record<string, unknown>, attempts = 2) {
+  let last: any = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    last = await callTelegramDirect(botToken, method, payload);
+    if (last?.ok) return last;
+    if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, 600 * (attempt + 1)));
+  }
+  return last;
+}
+
 async function readJsonBody(req: Request) {
   try {
     return await req.json();
@@ -631,6 +663,15 @@ async function deriveTelegramWebhookSecret(telegramApiKey: string): Promise<stri
     .replace(/=+$/g, '');
 }
 
+async function deriveBot2WebhookSecret(botId: string, botToken: string): Promise<string> {
+  const data = new TextEncoder().encode(`telegram-bot2-webhook:${botId}:${botToken}`);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
 function safeEqual(a: string | null, b: string): boolean {
   if (!a || a.length !== b.length) return false;
   let diff = 0;
@@ -641,12 +682,26 @@ function safeEqual(a: string | null, b: string): boolean {
 }
 
 async function callTelegramDirect(botToken: string, method: string, payload: Record<string, unknown>) {
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  return response.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TELEGRAM_DIRECT_TIMEOUT_MS);
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { ok: false, description: text || 'Invalid JSON from Telegram' };
+    }
+  } catch (err) {
+    return { ok: false, description: err instanceof Error ? err.message : String(err) };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function editOrSendMessage(chatId: number, messageId: number | undefined, text: string, LOVABLE_API_KEY: string, TELEGRAM_API_KEY: string, replyMarkup?: unknown) {

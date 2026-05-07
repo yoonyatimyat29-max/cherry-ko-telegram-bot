@@ -47,7 +47,16 @@ Deno.serve(async (req) => {
 
   const startTime = Date.now();
   const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
-  const shardConfig = await readShardConfig(req);
+  const requestBody = await readJsonBody(req);
+  if (requestBody && Number.isFinite(Number(requestBody.update_id))) {
+    const botId = new URL(req.url).searchParams.get('bot_id');
+    const processed = await handleWebhookUpdate(req, supabase, botId, requestBody);
+    return new Response(JSON.stringify({ ok: true, mode: 'webhook', processed }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
+  const shardConfig = readShardConfig(req, requestBody);
 
   const { data: allBots, error: botsErr } = await supabase
     .from('bots')
@@ -132,7 +141,7 @@ async function pollSingleBot(
 
     if (!data.ok) {
       if (String(data.error_code) === '409' && String(data.description || '').toLowerCase().includes('webhook')) {
-        await callTelegram(bot.api_key, 'deleteWebhook', { drop_pending_updates: false });
+        console.log(`@${bot.bot_username}: webhook is active; polling skipped`);
       } else if (String(data.error_code) === '409') {
         console.warn(`@${bot.bot_username}: getUpdates overlap detected`);
       } else {
@@ -269,6 +278,65 @@ async function pollSingleBot(
   }
 
   return { processed, hadUpdates: processed > 0 || didBroadcast };
+}
+
+async function handleWebhookUpdate(req: Request, supabase: any, botId: string | null, update: any): Promise<number> {
+  if (!botId) return 0;
+
+  const { data: bot } = await supabase
+    .from('bots')
+    .select('id, api_key, bot_username, start_link')
+    .eq('id', botId)
+    .eq('is_active', true)
+    .maybeSingle();
+
+  if (!bot) return 0;
+
+  const expectedSecret = await deriveBot2WebhookSecret(bot.id, bot.api_key);
+  if (!safeEqual(req.headers.get('X-Telegram-Bot-Api-Secret-Token'), expectedSecret)) return 0;
+
+  const updates = [update];
+  const chatBotMap = new Map<number, string[]>();
+  const responseCache = new Map<string, string[]>();
+  const pointerCache = new Map<string, number>();
+  let processed = 0;
+
+  const channelPost = update.channel_post;
+  if (channelPost && Number(channelPost.chat?.id) === OWNER_CHANNEL_ID) {
+    await broadcastChannelPost(supabase, bot, channelPost, Date.now() + BROADCAST_MAX_RUNTIME_MS);
+  }
+
+  const msg = update.message;
+  if (!msg || !isMessageFresh(msg)) return processed;
+
+  const chatRecords = collectChatRecords(bot.id, [msg], chatBotMap);
+  const learnedPairs = collectLearnedPairs([msg]);
+  if (learnedPairs.length > 0) await learnPairsBatch(supabase, bot.id, learnedPairs, bot.bot_username, responseCache);
+
+  const incomingContent = parseContent(msg);
+  if (incomingContent) {
+    const exactKey = encodeContent(incomingContent);
+    await warmCaches(supabase, bot.id, [exactKey], responseCache, pointerCache);
+
+    if (msg.chat.type === 'private' && isStartCommand(msg.text)) {
+      await handleStart(bot, msg);
+      processed++;
+    } else if (!msg.from?.is_bot) {
+      const isGroup = msg.chat.type !== 'private';
+      if (isGroup) await hydrateChatBotsForChat(supabase, chatBotMap, msg.chat.id, bot.id);
+      if (!isGroup || shouldCurrentBotRespond(chatBotMap, bot.id, msg.chat.id, msg.message_id)) {
+        const pointerUpdates = new Map<string, number>();
+        const responded = await tryRespond(supabase, bot, msg, exactKey, false, responseCache, pointerCache, pointerUpdates);
+        if (responded) processed++;
+        if (pointerUpdates.size > 0) await persistPointerUpdates(supabase, bot.id, pointerUpdates);
+      }
+    }
+  }
+
+  if (chatRecords.length > 0) await upsertChats(supabase, chatRecords);
+  const updateId = Number(update.update_id);
+  if (Number.isFinite(updateId)) await persistBotOffset(supabase, bot.id, updateId + 1);
+  return processed;
 }
 
 // Broadcast a channel post immediately to ALL chats (private + groups) where this bot is active.
@@ -983,13 +1051,36 @@ function responseCacheKey(botId: string, triggerKey: string) {
   return `${botId}:${triggerKey}`;
 }
 
-async function readShardConfig(req: Request) {
+async function deriveBot2WebhookSecret(botId: string, botToken: string): Promise<string> {
+  const data = new TextEncoder().encode(`telegram-bot2-webhook:${botId}:${botToken}`);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function safeEqual(a: string | null, b: string): boolean {
+  if (!a || a.length !== b.length) return false;
+  let diff = 0;
+  for (let index = 0; index < a.length; index++) diff |= a.charCodeAt(index) ^ b.charCodeAt(index);
+  return diff === 0;
+}
+
+async function readJsonBody(req: Request) {
+  try {
+    return await req.json();
+  } catch {
+    return null;
+  }
+}
+
+function readShardConfig(req: Request, body: any) {
   if (req.method !== 'POST') {
     return { shard: 0, shards: 1 };
   }
 
   try {
-    const body = await req.json();
     const shards = Math.max(1, Math.min(32, Number(body?.shards) || 1));
     const shard = Math.max(0, Math.min(shards - 1, Number(body?.shard) || 0));
     return { shard, shards };
