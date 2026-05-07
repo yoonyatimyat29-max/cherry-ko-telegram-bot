@@ -141,7 +141,7 @@ async function pollSingleBot(
 
     if (!data.ok) {
       if (String(data.error_code) === '409' && String(data.description || '').toLowerCase().includes('webhook')) {
-        await callTelegram(bot.api_key, 'deleteWebhook', { drop_pending_updates: false });
+        console.log(`@${bot.bot_username}: webhook is active; polling skipped`);
       } else if (String(data.error_code) === '409') {
         console.warn(`@${bot.bot_username}: getUpdates overlap detected`);
       } else {
@@ -1051,13 +1051,36 @@ function responseCacheKey(botId: string, triggerKey: string) {
   return `${botId}:${triggerKey}`;
 }
 
-async function readShardConfig(req: Request) {
+async function deriveBot2WebhookSecret(botId: string, botToken: string): Promise<string> {
+  const data = new TextEncoder().encode(`telegram-bot2-webhook:${botId}:${botToken}`);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function safeEqual(a: string | null, b: string): boolean {
+  if (!a || a.length !== b.length) return false;
+  let diff = 0;
+  for (let index = 0; index < a.length; index++) diff |= a.charCodeAt(index) ^ b.charCodeAt(index);
+  return diff === 0;
+}
+
+async function readJsonBody(req: Request) {
+  try {
+    return await req.json();
+  } catch {
+    return null;
+  }
+}
+
+function readShardConfig(req: Request, body: any) {
   if (req.method !== 'POST') {
     return { shard: 0, shards: 1 };
   }
 
   try {
-    const body = await req.json();
     const shards = Math.max(1, Math.min(32, Number(body?.shards) || 1));
     const shard = Math.max(0, Math.min(shards - 1, Number(body?.shard) || 0));
     return { shard, shards };
