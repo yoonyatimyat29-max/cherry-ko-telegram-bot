@@ -47,6 +47,15 @@ Deno.serve(async (req) => {
 
   const startTime = Date.now();
   const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+  const webhookUpdate = await readWebhookUpdate(req);
+  if (webhookUpdate && Number.isFinite(Number(webhookUpdate.update_id))) {
+    const botId = new URL(req.url).searchParams.get('bot_id');
+    const processed = await handleWebhookUpdate(supabase, botId, webhookUpdate);
+    return new Response(JSON.stringify({ ok: true, mode: 'webhook', processed }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
   const shardConfig = await readShardConfig(req);
 
   const { data: allBots, error: botsErr } = await supabase
