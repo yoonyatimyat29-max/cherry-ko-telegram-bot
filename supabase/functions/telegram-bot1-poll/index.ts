@@ -623,6 +623,29 @@ async function callGateway(
   }
 }
 
+async function configureBot2Webhook(botId: string, botToken: string) {
+  const supabaseUrl = Deno.env.get('SUPABASE_URL');
+  if (!supabaseUrl) return { ok: false, description: 'SUPABASE_URL is not configured' };
+
+  const secretToken = await deriveBot2WebhookSecret(botId, botToken);
+  return callTelegramDirectWithRetry(botToken, 'setWebhook', {
+    url: `${supabaseUrl}/functions/v1/telegram-bot2-poll?bot_id=${encodeURIComponent(botId)}`,
+    secret_token: secretToken,
+    allowed_updates: ['message', 'channel_post'],
+    drop_pending_updates: false,
+  }, 2);
+}
+
+async function callTelegramDirectWithRetry(botToken: string, method: string, payload: Record<string, unknown>, attempts = 2) {
+  let last: any = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    last = await callTelegramDirect(botToken, method, payload);
+    if (last?.ok) return last;
+    if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, 600 * (attempt + 1)));
+  }
+  return last;
+}
+
 async function readJsonBody(req: Request) {
   try {
     return await req.json();
@@ -640,6 +663,15 @@ async function deriveTelegramWebhookSecret(telegramApiKey: string): Promise<stri
     .replace(/=+$/g, '');
 }
 
+async function deriveBot2WebhookSecret(botId: string, botToken: string): Promise<string> {
+  const data = new TextEncoder().encode(`telegram-bot2-webhook:${botId}:${botToken}`);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
 function safeEqual(a: string | null, b: string): boolean {
   if (!a || a.length !== b.length) return false;
   let diff = 0;
@@ -650,12 +682,26 @@ function safeEqual(a: string | null, b: string): boolean {
 }
 
 async function callTelegramDirect(botToken: string, method: string, payload: Record<string, unknown>) {
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  return response.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TELEGRAM_DIRECT_TIMEOUT_MS);
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { ok: false, description: text || 'Invalid JSON from Telegram' };
+    }
+  } catch (err) {
+    return { ok: false, description: err instanceof Error ? err.message : String(err) };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function editOrSendMessage(chatId: number, messageId: number | undefined, text: string, LOVABLE_API_KEY: string, TELEGRAM_API_KEY: string, replyMarkup?: unknown) {
