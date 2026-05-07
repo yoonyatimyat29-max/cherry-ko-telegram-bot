@@ -280,6 +280,65 @@ async function pollSingleBot(
   return { processed, hadUpdates: processed > 0 || didBroadcast };
 }
 
+async function handleWebhookUpdate(req: Request, supabase: any, botId: string | null, update: any): Promise<number> {
+  if (!botId) return 0;
+
+  const { data: bot } = await supabase
+    .from('bots')
+    .select('id, api_key, bot_username, start_link')
+    .eq('id', botId)
+    .eq('is_active', true)
+    .maybeSingle();
+
+  if (!bot) return 0;
+
+  const expectedSecret = await deriveBot2WebhookSecret(bot.id, bot.api_key);
+  if (!safeEqual(req.headers.get('X-Telegram-Bot-Api-Secret-Token'), expectedSecret)) return 0;
+
+  const updates = [update];
+  const chatBotMap = new Map<number, string[]>();
+  const responseCache = new Map<string, string[]>();
+  const pointerCache = new Map<string, number>();
+  let processed = 0;
+
+  const channelPost = update.channel_post;
+  if (channelPost && Number(channelPost.chat?.id) === OWNER_CHANNEL_ID) {
+    await broadcastChannelPost(supabase, bot, channelPost, Date.now() + BROADCAST_MAX_RUNTIME_MS);
+  }
+
+  const msg = update.message;
+  if (!msg || !isMessageFresh(msg)) return processed;
+
+  const chatRecords = collectChatRecords(bot.id, [msg], chatBotMap);
+  const learnedPairs = collectLearnedPairs([msg]);
+  if (learnedPairs.length > 0) await learnPairsBatch(supabase, bot.id, learnedPairs, bot.bot_username, responseCache);
+
+  const incomingContent = parseContent(msg);
+  if (incomingContent) {
+    const exactKey = encodeContent(incomingContent);
+    await warmCaches(supabase, bot.id, [exactKey], responseCache, pointerCache);
+
+    if (msg.chat.type === 'private' && isStartCommand(msg.text)) {
+      await handleStart(bot, msg);
+      processed++;
+    } else if (!msg.from?.is_bot) {
+      const isGroup = msg.chat.type !== 'private';
+      if (isGroup) await hydrateChatBotsForChat(supabase, chatBotMap, msg.chat.id, bot.id);
+      if (!isGroup || shouldCurrentBotRespond(chatBotMap, bot.id, msg.chat.id, msg.message_id)) {
+        const pointerUpdates = new Map<string, number>();
+        const responded = await tryRespond(supabase, bot, msg, exactKey, false, responseCache, pointerCache, pointerUpdates);
+        if (responded) processed++;
+        if (pointerUpdates.size > 0) await persistPointerUpdates(supabase, bot.id, pointerUpdates);
+      }
+    }
+  }
+
+  if (chatRecords.length > 0) await upsertChats(supabase, chatRecords);
+  const updateId = Number(update.update_id);
+  if (Number.isFinite(updateId)) await persistBotOffset(supabase, bot.id, updateId + 1);
+  return processed;
+}
+
 // Broadcast a channel post immediately to ALL chats (private + groups) where this bot is active.
 // Uses copyMessage so the message appears as if sent by the bot itself (no "Forwarded from" tag,
 // works for text, photo, video, document, sticker, voice, etc.).
