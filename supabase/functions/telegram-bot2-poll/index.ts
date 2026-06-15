@@ -715,6 +715,25 @@ function shouldCurrentBotRespond(chatBotMap: Map<number, string[]>, currentBotId
   return botIds[turnIndex] === currentBotId;
 }
 
+// Reject any message that is not plain text or that contains a link / premium emoji.
+// Rules (per user): only text<->text Q&A is learned. No stickers, voice, audio, premium emoji,
+// and no messages containing URLs (http/https, www, t.me, or any url/text_link entity).
+const URL_LIKE_REGEX = /(https?:\/\/|www\.|t\.me\/|telegram\.me\/|tg:\/\/|\b[\w-]+\.(?:com|net|org|io|me|co|info|biz|app|xyz|live|tv|ru|uk|in|us|cn|jp|kr|de|fr|es|it|pl|tr|br|ca|au|ph|th|vn|id|sg|hk|tw|mm|cc|to|ly|gg|sh|ai|dev)\b)/i;
+
+function isPlainTextLearnable(msg: any): boolean {
+  // Must be a non-empty text message with no media.
+  if (typeof msg?.text !== 'string' || msg.text.trim().length === 0) return false;
+  if (msg.sticker || msg.voice || msg.audio || msg.photo || msg.video || msg.document || msg.animation || msg.video_note) return false;
+  // Reject premium / custom emoji and links via entities.
+  const entities = [...(msg.entities || []), ...(msg.caption_entities || [])];
+  for (const e of entities) {
+    if (e?.type === 'custom_emoji' || e?.type === 'url' || e?.type === 'text_link') return false;
+  }
+  // Reject if the raw text contains a URL-like substring.
+  if (URL_LIKE_REGEX.test(msg.text)) return false;
+  return true;
+}
+
 function collectLearnedPairs(messages: any[]): LearnedPair[] {
   const uniquePairs = new Map<string, LearnedPair>();
 
@@ -722,9 +741,16 @@ function collectLearnedPairs(messages: any[]): LearnedPair[] {
     if (msg?.from?.is_bot) continue;
     if (!msg?.reply_to_message) continue;
 
+    // Only learn pure text<->text pairs without links or premium emoji.
+    if (!isPlainTextLearnable(msg.reply_to_message)) continue;
+    if (!isPlainTextLearnable(msg)) continue;
+
     const triggerContent = parseContent(msg.reply_to_message);
     const responseContent = parseResponseContent(msg);
     if (!triggerContent || !responseContent) continue;
+    if (triggerContent.kind !== 'text' || (responseContent.kind !== 'text' && responseContent.kind !== 'text_rich')) continue;
+    // Extra guard: never store text_rich (premium emoji) responses.
+    if (responseContent.kind === 'text_rich') continue;
 
     const triggerKey = encodeContent(triggerContent);
     const responseKey = encodeContent(responseContent);
